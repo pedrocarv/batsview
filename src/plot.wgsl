@@ -1,7 +1,6 @@
 struct Uniforms {
     bounds: vec4<f32>,
     limits: vec4<f32>,
-    view: vec4<f32>,
     shape: vec4<f32>,
 };
 
@@ -28,14 +27,6 @@ fn vs_main(input: VertexInput) -> VertexOutput {
         max(uniforms.bounds.w - uniforms.bounds.z, 1e-20),
     );
     var position = 2.0 * (input.position - center) / span;
-    let data_aspect = uniforms.shape.x;
-    let viewport_aspect = max(uniforms.view.w, 1e-6);
-    if (data_aspect > viewport_aspect) {
-        position.y *= viewport_aspect / data_aspect;
-    } else {
-        position.x *= data_aspect / viewport_aspect;
-    }
-    position = position * uniforms.view.z + uniforms.view.xy;
     var output: VertexOutput;
     output.position = vec4<f32>(position.x, position.y, 0.0, 1.0);
     output.value = input.value;

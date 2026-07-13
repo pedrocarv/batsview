@@ -18,6 +18,8 @@ aliases through a small process boundary.
 This first milestone supports directory browsing, timestep navigation,
 metadata inspection, searchable source/canonical variable names, selective
 variable loading, linear/log color scaling, limits, and GPU pan/zoom/reset.
+Run discovery is performed natively without starting Python, and plot axes can
+be edited directly in data coordinates or adjusted with mouse and button zoom.
 
 ## Development
 

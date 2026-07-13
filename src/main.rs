@@ -5,6 +5,7 @@
 
 mod app;
 mod bridge;
+mod catalog;
 mod protocol;
 mod render;
 

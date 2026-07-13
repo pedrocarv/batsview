@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 
-use crate::protocol::{FileInfo, ScanResult};
+use crate::protocol::FileInfo;
 
 #[derive(Clone, Debug)]
 pub struct Bridge {
@@ -54,14 +54,6 @@ impl Bridge {
             ),
             source: source_path(),
         }
-    }
-
-    pub fn scan(&self, directory: &Path, recursive: bool) -> Result<ScanResult> {
-        let mut arguments = vec![OsString::from("scan"), directory.as_os_str().to_owned()];
-        if recursive {
-            arguments.push(OsString::from("--recursive"));
-        }
-        self.json(&arguments)
     }
 
     pub fn inspect(&self, path: &Path) -> Result<FileInfo> {

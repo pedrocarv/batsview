@@ -19,9 +19,7 @@ pub enum Scale {
 pub struct DisplayState {
     pub scale: Scale,
     pub limits: [f32; 2],
-    pub pan: [f32; 2],
-    pub zoom: f32,
-    pub viewport_aspect: f32,
+    pub view_bounds: [f32; 4],
 }
 
 impl Default for DisplayState {
@@ -29,9 +27,7 @@ impl Default for DisplayState {
         Self {
             scale: Scale::Linear,
             limits: [0.0, 1.0],
-            pan: [0.0, 0.0],
-            zoom: 1.0,
-            viewport_aspect: 1.0,
+            view_bounds: [0.0, 1.0, 0.0, 1.0],
         }
     }
 }
@@ -45,17 +41,84 @@ pub struct SharedPlot {
 
 impl SharedPlot {
     pub fn set_data(&mut self, data: PlotData) {
+        let preserve_view = self.data.as_ref().is_some_and(|current| {
+            current.header.x_label == data.header.x_label
+                && current.header.y_label == data.header.y_label
+                && similar_bounds(current.header.bounds, data.header.bounds)
+        });
         self.display.limits = data.header.value_range;
-        self.display.pan = [0.0, 0.0];
-        self.display.zoom = 1.0;
+        if !preserve_view {
+            self.display.view_bounds = usable_bounds(data.header.bounds);
+        }
         self.data = Some(Arc::new(data));
         self.generation = self.generation.wrapping_add(1);
     }
 
     pub fn reset_view(&mut self) {
-        self.display.pan = [0.0, 0.0];
-        self.display.zoom = 1.0;
+        if let Some(data) = &self.data {
+            self.display.view_bounds = usable_bounds(data.header.bounds);
+        }
     }
+
+    pub fn set_view_bounds(&mut self, bounds: [f32; 4]) -> bool {
+        if valid_bounds(bounds) {
+            self.display.view_bounds = bounds;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn pan_view(&mut self, x_fraction: f32, y_fraction: f32) {
+        let bounds = &mut self.display.view_bounds;
+        let x_offset = (bounds[1] - bounds[0]) * x_fraction;
+        let y_offset = (bounds[3] - bounds[2]) * y_fraction;
+        bounds[0] += x_offset;
+        bounds[1] += x_offset;
+        bounds[2] += y_offset;
+        bounds[3] += y_offset;
+    }
+
+    pub fn zoom_view(&mut self, factor: f32) {
+        let Some(data) = &self.data else { return };
+        let factor = factor.clamp(0.01, 100.0);
+        let bounds = &mut self.display.view_bounds;
+        for (low, high, data_low, data_high) in [(0, 1, 0, 1), (2, 3, 2, 3)] {
+            let center = 0.5 * (bounds[low] + bounds[high]);
+            let data_span = (data.header.bounds[data_high] - data.header.bounds[data_low])
+                .abs()
+                .max(1.0e-20);
+            let span = ((bounds[high] - bounds[low]).abs() * factor)
+                .clamp(data_span * 1.0e-6, data_span * 1.0e6);
+            bounds[low] = center - 0.5 * span;
+            bounds[high] = center + 0.5 * span;
+        }
+    }
+}
+
+fn similar_bounds(left: [f32; 4], right: [f32; 4]) -> bool {
+    left.into_iter().zip(right).all(|(left, right)| {
+        let scale = left.abs().max(right.abs()).max(1.0);
+        (left - right).abs() <= 1.0e-5 * scale
+    })
+}
+
+fn valid_bounds(bounds: [f32; 4]) -> bool {
+    bounds.into_iter().all(f32::is_finite) && bounds[1] > bounds[0] && bounds[3] > bounds[2]
+}
+
+fn usable_bounds(mut bounds: [f32; 4]) -> [f32; 4] {
+    for (low, high) in [(0, 1), (2, 3)] {
+        if !bounds[low].is_finite() || !bounds[high].is_finite() {
+            bounds[low] = 0.0;
+            bounds[high] = 1.0;
+        } else if bounds[high] <= bounds[low] {
+            let padding = bounds[low].abs().max(1.0) * 1.0e-3;
+            bounds[low] -= padding;
+            bounds[high] += padding;
+        }
+    }
+    bounds
 }
 
 pub type PlotHandle = Arc<Mutex<SharedPlot>>;
@@ -65,7 +128,6 @@ pub type PlotHandle = Arc<Mutex<SharedPlot>>;
 struct Uniforms {
     bounds: [f32; 4],
     limits: [f32; 4],
-    view: [f32; 4],
     shape: [f32; 4],
 }
 
@@ -204,10 +266,7 @@ impl egui_wgpu::CallbackTrait for PlotCallback {
             gpu.index_count = data.indices.len().try_into().unwrap_or(u32::MAX);
             gpu.generation = shared.generation;
         }
-        let bounds = data.header.bounds;
-        let data_aspect = ((bounds[1] - bounds[0]) / (bounds[3] - bounds[2]))
-            .abs()
-            .max(1.0e-12);
+        let bounds = shared.display.view_bounds;
         let positive = data.header.positive_range.unwrap_or([f32::NAN, f32::NAN]);
         let uniforms = Uniforms {
             bounds,
@@ -217,14 +276,8 @@ impl egui_wgpu::CallbackTrait for PlotCallback {
                 positive[0],
                 positive[1],
             ],
-            view: [
-                shared.display.pan[0],
-                shared.display.pan[1],
-                shared.display.zoom,
-                shared.display.viewport_aspect,
-            ],
             shape: [
-                data_aspect,
+                0.0,
                 if shared.display.scale == Scale::Logarithmic {
                     1.0
                 } else {
@@ -253,5 +306,52 @@ impl egui_wgpu::CallbackTrait for PlotCallback {
         render_pass.set_vertex_buffer(0, vertices.slice(..));
         render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
         render_pass.draw_indexed(0..gpu.index_count, 0, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::PlotHeader;
+
+    fn plot_data() -> PlotData {
+        PlotData {
+            header: PlotHeader {
+                protocol: 1,
+                path: "test.plt".into(),
+                title: "test".into(),
+                section: Some("z=0".into()),
+                zone: "cut".into(),
+                variable: "density".into(),
+                source_variable: "Rho".into(),
+                unit: None,
+                x_label: "X".into(),
+                y_label: "Y".into(),
+                point_count: 0,
+                triangle_count: 0,
+                bounds: [-10.0, 10.0, -5.0, 5.0],
+                value_range: [1.0, 2.0],
+                positive_range: Some([1.0, 2.0]),
+            },
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn view_uses_data_coordinates_for_pan_zoom_and_reset() {
+        let mut plot = SharedPlot::default();
+        plot.set_data(plot_data());
+        plot.zoom_view(0.5);
+        assert_eq!(plot.display.view_bounds, [-5.0, 5.0, -2.5, 2.5]);
+        plot.pan_view(0.1, -0.2);
+        assert_eq!(plot.display.view_bounds, [-4.0, 6.0, -3.5, 1.5]);
+        assert!(!plot.set_view_bounds([2.0, 1.0, -1.0, 1.0]));
+        assert_eq!(plot.display.view_bounds, [-4.0, 6.0, -3.5, 1.5]);
+        assert!(plot.set_view_bounds([-2.0, 2.0, -1.0, 1.0]));
+        plot.set_data(plot_data());
+        assert_eq!(plot.display.view_bounds, [-2.0, 2.0, -1.0, 1.0]);
+        plot.reset_view();
+        assert_eq!(plot.display.view_bounds, [-10.0, 10.0, -5.0, 5.0]);
     }
 }

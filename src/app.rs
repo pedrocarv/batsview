@@ -11,11 +11,13 @@ use eframe::egui::{self, Color32, RichText, Sense, Stroke, StrokeKind};
 
 use crate::{
     bridge::Bridge,
+    catalog::scan_directory,
     protocol::{FileInfo, PlotData, PlotFile, ScanResult, read_plot},
     render::{PlotCallback, PlotHandle, PlotResources, Scale, SharedPlot},
 };
 
 enum Event {
+    DirectoryChosen(Option<PathBuf>),
     Scan(Result<ScanResult>),
     Inspect {
         path: String,
@@ -41,6 +43,7 @@ pub struct ViewerApp {
     selected_variable: Option<String>,
     file_filter: String,
     variable_filter: String,
+    choosing_run: bool,
     loading: bool,
     status: String,
 }
@@ -70,13 +73,14 @@ impl ViewerApp {
             selected_variable: None,
             file_filter: String::new(),
             variable_filter: String::new(),
+            choosing_run: false,
             loading: false,
             status: "Choose a BATS-R-US output directory to begin".to_owned(),
         };
         if let Some(path) = initial_path {
             if path.is_dir() {
                 app.scan(path);
-            } else if path.extension().and_then(|value| value.to_str()) == Some("plt") {
+            } else if is_plt_file(&path) {
                 app.directory = path.parent().map(Path::to_path_buf);
                 app.inspect(path.to_string_lossy().into_owned());
             }
@@ -85,9 +89,19 @@ impl ViewerApp {
     }
 
     fn choose_directory(&mut self) {
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            self.scan(path);
-        }
+        self.choosing_run = true;
+        self.status = "Choosing a run directory…".to_owned();
+        let sender = self.sender.clone();
+        let initial_directory = self.directory.clone();
+        thread::spawn(move || {
+            let mut dialog = rfd::AsyncFileDialog::new().set_title("Open BATS-R-US run");
+            if let Some(directory) = initial_directory {
+                dialog = dialog.set_directory(directory);
+            }
+            let selected =
+                pollster::block_on(dialog.pick_folder()).map(|handle| handle.path().to_owned());
+            let _ = sender.send(Event::DirectoryChosen(selected));
+        });
     }
 
     fn scan(&mut self, directory: PathBuf) {
@@ -98,11 +112,10 @@ impl ViewerApp {
         self.selected_variable = None;
         self.loading = true;
         self.status = format!("Scanning {}…", directory.display());
-        let bridge = self.bridge.clone();
         let sender = self.sender.clone();
         let recursive = self.recursive;
         thread::spawn(move || {
-            let _ = sender.send(Event::Scan(bridge.scan(&directory, recursive)));
+            let _ = sender.send(Event::Scan(scan_directory(&directory, recursive)));
         });
     }
 
@@ -148,6 +161,14 @@ impl ViewerApp {
     fn poll_events(&mut self) {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
+                Event::DirectoryChosen(Some(directory)) => {
+                    self.choosing_run = false;
+                    self.scan(directory);
+                }
+                Event::DirectoryChosen(None) => {
+                    self.choosing_run = false;
+                    self.status = "Run selection canceled".to_owned();
+                }
                 Event::Scan(result) => match result {
                     Ok(scan) if scan.protocol == 1 => {
                         self.files = scan.files;
@@ -238,7 +259,10 @@ impl ViewerApp {
     fn top_bar(&mut self, root: &mut egui::Ui) {
         egui::Panel::top("top_bar").show(root, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Open run…").clicked() {
+                if ui
+                    .add_enabled(!self.choosing_run, egui::Button::new("Open run…"))
+                    .clicked()
+                {
                     self.choose_directory();
                 }
                 let changed = ui.checkbox(&mut self.recursive, "Recursive").changed();
@@ -266,7 +290,7 @@ impl ViewerApp {
                         .strong(),
                     );
                 }
-                if self.loading {
+                if self.loading || self.choosing_run {
                     ui.spinner();
                 }
             });
@@ -397,11 +421,27 @@ impl ViewerApp {
                     ui.label("to");
                     ui.add(egui::DragValue::new(&mut shared.display.limits[1]).speed(0.1));
                 });
-                if ui.button("Reset view").clicked() {
-                    shared.reset_view();
+                ui.add_space(8.0);
+                ui.label("Axis limits");
+                let mut view_bounds = shared.display.view_bounds;
+                let bounds_changed = axis_limit_row(ui, "X", &mut view_bounds, 0, 1)
+                    | axis_limit_row(ui, "Y", &mut view_bounds, 2, 3);
+                if bounds_changed {
+                    shared.set_view_bounds(view_bounds);
                 }
+                ui.horizontal(|ui| {
+                    if ui.button("Zoom out").clicked() {
+                        shared.zoom_view(1.25);
+                    }
+                    if ui.button("Zoom in").clicked() {
+                        shared.zoom_view(0.8);
+                    }
+                    if ui.button("Fit").clicked() {
+                        shared.reset_view();
+                    }
+                });
                 ui.add_space(12.0);
-                ui.small("Drag to pan · wheel to zoom · double-click to reset");
+                ui.small("Edit X/Y limits · drag to pan · wheel to zoom · double-click to fit");
             });
     }
 
@@ -425,11 +465,9 @@ impl ViewerApp {
 
             {
                 let mut shared = self.plot.lock().unwrap();
-                shared.display.viewport_aspect = (rect.width() / rect.height()).max(1.0e-6);
                 if response.dragged() {
                     let delta = ui.input(|input| input.pointer.delta());
-                    shared.display.pan[0] += 2.0 * delta.x / rect.width();
-                    shared.display.pan[1] -= 2.0 * delta.y / rect.height();
+                    shared.pan_view(-delta.x / rect.width(), delta.y / rect.height());
                     context.request_repaint();
                 }
                 if response.double_clicked() {
@@ -438,8 +476,7 @@ impl ViewerApp {
                 if response.hovered() {
                     let scroll = context.input(|input| input.smooth_scroll_delta.y);
                     if scroll != 0.0 {
-                        shared.display.zoom =
-                            (shared.display.zoom * (scroll * 0.002).exp()).clamp(0.05, 500.0);
+                        shared.zoom_view((-scroll * 0.002).exp());
                         context.request_repaint();
                     }
                 }
@@ -516,11 +553,39 @@ impl ViewerApp {
             Color32::LIGHT_GRAY,
         );
         ui.painter().text(
+            rect.left_bottom() + egui::vec2(0.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            format_value(shared.display.view_bounds[0]),
+            egui::FontId::monospace(10.0),
+            Color32::from_gray(150),
+        );
+        ui.painter().text(
+            rect.right_bottom() + egui::vec2(0.0, 4.0),
+            egui::Align2::RIGHT_TOP,
+            format_value(shared.display.view_bounds[1]),
+            egui::FontId::monospace(10.0),
+            Color32::from_gray(150),
+        );
+        ui.painter().text(
             rect.left_center() + egui::vec2(-8.0, 0.0),
             egui::Align2::RIGHT_CENTER,
             &header.y_label,
             egui::FontId::proportional(13.0),
             Color32::LIGHT_GRAY,
+        );
+        ui.painter().text(
+            rect.left_top() - egui::vec2(6.0, 0.0),
+            egui::Align2::RIGHT_TOP,
+            format_value(shared.display.view_bounds[3]),
+            egui::FontId::monospace(10.0),
+            Color32::from_gray(150),
+        );
+        ui.painter().text(
+            rect.left_bottom() - egui::vec2(6.0, 0.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format_value(shared.display.view_bounds[2]),
+            egui::FontId::monospace(10.0),
+            Color32::from_gray(150),
         );
         let bar = egui::Rect::from_min_max(
             egui::pos2(rect.right() + 14.0, rect.top()),
@@ -555,6 +620,28 @@ impl ViewerApp {
     }
 }
 
+fn axis_limit_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    bounds: &mut [f32; 4],
+    low: usize,
+    high: usize,
+) -> bool {
+    let speed = ((bounds[high] - bounds[low]).abs() / 200.0).max(1.0e-6);
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let low_changed = ui
+            .add(egui::DragValue::new(&mut bounds[low]).speed(speed))
+            .changed();
+        ui.label("to");
+        let high_changed = ui
+            .add(egui::DragValue::new(&mut bounds[high]).speed(speed))
+            .changed();
+        low_changed || high_changed
+    })
+    .inner
+}
+
 impl eframe::App for ViewerApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_events();
@@ -569,7 +656,7 @@ impl eframe::App for ViewerApp {
         if let Some(path) = dropped.first() {
             if path.is_dir() {
                 self.scan(path.clone());
-            } else if path.extension().and_then(|value| value.to_str()) == Some("plt") {
+            } else if is_plt_file(path) {
                 if let Some(parent) = path.parent() {
                     self.directory = Some(parent.to_owned());
                 }
@@ -591,6 +678,12 @@ impl eframe::App for ViewerApp {
         });
         self.plot_panel(root);
     }
+}
+
+fn is_plt_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("plt"))
 }
 
 fn exchange_path(path: &str, variable: &str) -> PathBuf {
