@@ -453,7 +453,21 @@ impl ViewerApp {
                 (available.x - 72.0).max(100.0),
                 (available.y - 38.0).max(100.0),
             );
-            let (rect, response) = ui.allocate_exact_size(plot_size, Sense::click_and_drag());
+            let (outer_rect, _) = ui.allocate_exact_size(plot_size, Sense::hover());
+            let (has_data, view_bounds) = {
+                let shared = self.plot.lock().unwrap();
+                (shared.data.is_some(), shared.display.view_bounds)
+            };
+            let rect = if has_data {
+                fit_plot_rect(outer_rect, view_bounds)
+            } else {
+                outer_rect
+            };
+            let response = ui.interact(
+                rect,
+                ui.id().with("plot_interaction"),
+                Sense::click_and_drag(),
+            );
             ui.painter()
                 .rect_filled(rect, 2.0, Color32::from_rgb(15, 18, 24));
             ui.painter().rect_stroke(
@@ -482,7 +496,6 @@ impl ViewerApp {
                 }
             }
 
-            let has_data = self.plot.lock().unwrap().data.is_some();
             if has_data {
                 ui.painter()
                     .add(PlotCallback::paint_callback(rect, self.plot.clone()));
@@ -620,6 +633,22 @@ impl ViewerApp {
     }
 }
 
+fn fit_plot_rect(outer: egui::Rect, bounds: [f32; 4]) -> egui::Rect {
+    let x_span = (bounds[1] - bounds[0]).abs();
+    let y_span = (bounds[3] - bounds[2]).abs();
+    if !x_span.is_finite() || !y_span.is_finite() || x_span <= 0.0 || y_span <= 0.0 {
+        return outer;
+    }
+    let plot_aspect = x_span / y_span;
+    let outer_aspect = outer.width() / outer.height().max(1.0e-6);
+    let size = if plot_aspect > outer_aspect {
+        egui::vec2(outer.width(), outer.width() / plot_aspect)
+    } else {
+        egui::vec2(outer.height() * plot_aspect, outer.height())
+    };
+    egui::Rect::from_center_size(outer.center(), size)
+}
+
 fn axis_limit_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -729,4 +758,19 @@ fn turbo_color(value: f32) -> Color32 {
             0.1066733, 12.641946, -60.582047, 110.36277, -89.90311, 27.34825,
         ]),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_plot_rect;
+    use eframe::egui;
+
+    #[test]
+    fn plot_rect_preserves_coordinate_aspect_ratio() {
+        let outer = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0));
+        let square = fit_plot_rect(outer, [-1.0, 1.0, -1.0, 1.0]);
+        assert_eq!(square.size(), egui::vec2(100.0, 100.0));
+        let wide = fit_plot_rect(outer, [-2.0, 2.0, -0.5, 0.5]);
+        assert_eq!(wide.size(), egui::vec2(200.0, 50.0));
+    }
 }
