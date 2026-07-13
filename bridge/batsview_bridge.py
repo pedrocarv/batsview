@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import struct
 import sys
@@ -18,6 +19,19 @@ import batsplot as bp
 
 PROTOCOL = 1
 MAGIC = b"BPV1"
+
+
+def _default_cache_dir() -> Path:
+    override = os.environ.get("BATSVIEW_CACHE_DIR")
+    if override:
+        return Path(override).expanduser()
+    if sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        return root / "BATSView" / "cache"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "BATSView"
+    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return root / "batsview"
 
 
 def _json(value: object) -> None:
@@ -255,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("output")
     export.add_argument("--zone", type=int, default=0)
     export.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
-    export.add_argument("--cache-dir", default=".batsview-cache")
+    export.add_argument("--cache-dir", default=str(_default_cache_dir()))
     export.set_defaults(handler=command_export)
     return parser
 

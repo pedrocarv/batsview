@@ -47,14 +47,41 @@ The viewer honors these environment variables:
   with `python` as the Windows fallback).
 - `BATSPLOT_SOURCE`: directory prepended to `PYTHONPATH`, normally the
   `batsplot` repository's `src` directory.
+- `BATSVIEW_CACHE_DIR`: optional override for the persistent reader cache.
 
-## End-user packaging
+## End-user installation
 
-Release archives contain the Rust executable and a platform-specific `bridge`
-directory built with PyInstaller. Users do not need to install Python. The
-directory form avoids the extraction delay paid by one-file Python bundles on
-every selective read. GitHub Actions builds Windows, Linux, and macOS
-artifacts; see `.github/workflows/release.yml`.
+GitHub Actions artifacts are native desktop packages. Users do not need a
+terminal, Rust, or Python:
+
+- macOS: open `BATSView.app` from Finder (normally move it to Applications);
+- Windows: run the BATSView setup `.exe`, then launch it from the Start menu;
+- Linux: mark the `.AppImage` executable once, then open it from the desktop or
+  file manager.
+
+The installed app includes the platform-specific Python bridge and `batsplot`.
+The directory-form bridge avoids the extraction delay paid by one-file Python
+bundles on every selective read. BATSView also registers `.plt` files so an
+installed copy can open them directly.
+
+The initial packages are unsigned. macOS Gatekeeper and Windows SmartScreen may
+therefore ask the user to confirm the first launch. Production releases should
+be code-signed (and notarized on macOS).
+
+## Building a desktop package
+
+Install the build requirements, then run the cross-platform packaging helper:
+
+```bash
+python -m pip install -r bridge/requirements-build.txt
+cargo install cargo-packager --locked --version 0.11.8
+python scripts/package.py
+```
+
+The default output is a macOS `.app`, Windows NSIS installer `.exe`, or Linux
+`.AppImage`. Pass `--format dmg`, `--format wix`, or `--format deb` to request
+one of the other supported native formats. Outputs are written under
+`target/release/`.
 
 ## Bridge protocol
 

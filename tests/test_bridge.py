@@ -28,6 +28,12 @@ def test_record_extracts_bats_filename_fields(tmp_path: Path) -> None:
     assert record["dump_index"] == 42
 
 
+def test_cache_directory_can_be_overridden(tmp_path: Path, monkeypatch) -> None:
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("BATSVIEW_CACHE_DIR", str(cache))
+    assert bridge._default_cache_dir() == cache
+
+
 def test_export_writes_versioned_triangle_payload(tmp_path: Path, monkeypatch, capsys) -> None:
     path = tmp_path / "z=0_var_1_t00000001_n00000001.plt"
     path.write_bytes(b"fixture")

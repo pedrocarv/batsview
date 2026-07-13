@@ -4,6 +4,24 @@ version = "0.1.0"
 edition = "2024"
 description = "Fast cross-platform viewer for BATS-R-US plot files"
 license = "MIT"
+homepage = "https://github.com/pedrocarv/batsview"
+
+[package.metadata.packager]
+product-name = "BATSView"
+identifier = "io.github.pedrocarv.batsview"
+before-packaging-command = "cargo build --release"
+description = "Fast desktop browser and 2-D viewer for BATS-R-US plot files"
+long-description = "BATSView provides native file browsing and GPU-accelerated 2-D visualization for BATS-R-US Tecplot output."
+homepage = "https://github.com/pedrocarv/batsview"
+publisher = "BATSView"
+license-file = "LICENSE"
+category = "Graphics and Design"
+icons = ["packaging/icons/*.png"]
+resources = [{ src = "dist/batsview-bridge", target = "bridge" }]
+binaries = [{ path = "batsview", main = true }]
+file-associations = [
+    { extensions = ["plt"], mime-type = "application/x-tecplot", description = "BATS-R-US Tecplot plot file", name = "BATS-R-US plot", role = "viewer" },
+]
 
 [dependencies]
 anyhow = "1.0"

@@ -33,15 +33,9 @@ impl Bridge {
                 "batsview-bridge"
             };
             let directory = current.parent().unwrap_or(Path::new("."));
-            let standalone = directory.join(name);
-            let bundled = directory.join("bridge").join(name);
-            let sidecar = if standalone.is_file() {
-                Some(standalone)
-            } else if bundled.is_file() {
-                Some(bundled)
-            } else {
-                None
-            };
+            let sidecar = sidecar_candidates(directory, name)
+                .into_iter()
+                .find(|candidate| candidate.is_file());
             if let Some(sidecar) = sidecar {
                 return Self {
                     executable: sidecar,
@@ -122,6 +116,23 @@ impl Bridge {
     }
 }
 
+fn sidecar_candidates(executable_directory: &Path, name: &str) -> Vec<PathBuf> {
+    let mut candidates = vec![
+        executable_directory.join(name),
+        executable_directory.join("bridge").join(name),
+    ];
+
+    // macOS application bundle: BATSView.app/Contents/MacOS/batsview
+    candidates.push(executable_directory.join("../Resources/bridge").join(name));
+
+    // AppImage and Debian package: usr/bin/batsview + usr/lib/batsview/bridge/...
+    if let Some(usr) = executable_directory.parent() {
+        candidates.push(usr.join("lib/batsview/bridge").join(name));
+    }
+
+    candidates
+}
+
 fn source_path() -> Option<PathBuf> {
     env::var_os("BATSPLOT_SOURCE")
         .map(PathBuf::from)
@@ -143,5 +154,24 @@ fn bridge_error(output: &Output) -> String {
         stderr.trim().to_owned()
     } else {
         text.trim().to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sidecar_candidates;
+    use std::path::Path;
+
+    #[test]
+    fn packaged_sidecar_locations_are_considered() {
+        let candidates =
+            sidecar_candidates(Path::new("/opt/BATSView.app/Contents/MacOS"), "bridge");
+        assert!(candidates.contains(&Path::new("/opt/BATSView.app/Contents/MacOS/bridge").into()));
+        assert!(candidates.contains(
+            &Path::new("/opt/BATSView.app/Contents/MacOS/../Resources/bridge/bridge").into()
+        ));
+
+        let candidates = sidecar_candidates(Path::new("/usr/bin"), "bridge");
+        assert!(candidates.contains(&Path::new("/usr/lib/batsview/bridge/bridge").into()));
     }
 }
