@@ -1,0 +1,9 @@
+/target/
+.DS_Store
+/build*/
+/dist*/
+/.batsview-cache/
+*.bpv
+*.spec
+__pycache__/
+/.pytest_cache/
