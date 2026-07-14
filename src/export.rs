@@ -15,6 +15,7 @@ use crate::{
     plot_ui::{PlotChrome, PlotColors, fit_plot_rect, paint_plot_chrome},
     render::{PlotCallback, PlotHandle, PlotResources},
     scene::{AppearanceSettings, SceneDocument, ScopeContext},
+    streamlines::{StreamlineOverlay, paint_streamlines},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -82,6 +83,7 @@ pub struct ExportFrame {
     pub scope_variable: Option<String>,
     pub scope_relative_path: Option<String>,
     pub appearance: AppearanceSettings,
+    pub streamlines: Option<StreamlineOverlay>,
     pub chrome: PlotChrome,
     pub logical_size: egui::Vec2,
     pub pixels_per_point: f32,
@@ -163,6 +165,9 @@ pub fn render_plot_png(frame: ExportFrame) -> Result<PathBuf> {
         );
         ui.painter()
             .add(PlotCallback::paint_callback(plot_rect, frame.plot.clone()));
+        if let Some(streamlines) = &frame.streamlines {
+            paint_streamlines(ui, plot_rect, display.view_bounds, streamlines, false);
+        }
         let scope = ScopeContext {
             section: frame.scope_section.as_deref(),
             variable: frame.scope_variable.as_deref(),

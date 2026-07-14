@@ -8,7 +8,7 @@ use eframe::{
 use wgpu::util::DeviceExt;
 
 use crate::{
-    protocol::{PlotData, Vertex},
+    protocol::{PlotData, Position},
     scene::{AppearanceSettings, ColorMode, Colormap, Scale},
 };
 
@@ -43,7 +43,12 @@ pub struct SharedPlot {
 }
 
 impl SharedPlot {
-    pub fn set_data(&mut self, data: PlotData) {
+    pub fn clear_data(&mut self) {
+        self.data = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn set_data(&mut self, data: Arc<PlotData>) {
         let preserve_view = self.data.as_ref().is_some_and(|current| {
             current.header.x_label == data.header.x_label
                 && current.header.y_label == data.header.y_label
@@ -53,7 +58,7 @@ impl SharedPlot {
         if !preserve_view {
             self.display.view_bounds = usable_bounds(data.header.bounds);
         }
-        self.data = Some(Arc::new(data));
+        self.data = Some(data);
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -163,9 +168,11 @@ pub struct PlotResources {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform_buffer: wgpu::Buffer,
-    vertex_buffer: Option<wgpu::Buffer>,
+    position_buffer: Option<wgpu::Buffer>,
+    scalar_buffer: Option<wgpu::Buffer>,
     index_buffer: Option<wgpu::Buffer>,
     index_count: u32,
+    mesh_id: Option<String>,
     generation: u64,
 }
 
@@ -256,11 +263,18 @@ impl PlotResources {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32],
-                }],
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: size_of::<Position>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: size_of::<f32>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &wgpu::vertex_attr_array![1 => Float32],
+                    },
+                ],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -286,9 +300,11 @@ impl PlotResources {
             pipeline,
             bind_group,
             uniform_buffer,
-            vertex_buffer: None,
+            position_buffer: None,
+            scalar_buffer: None,
             index_buffer: None,
             index_count: 0,
+            mesh_id: None,
             generation: u64::MAX,
         }
     }
@@ -319,21 +335,31 @@ impl egui_wgpu::CallbackTrait for PlotCallback {
             return Vec::new();
         };
         if gpu.generation != shared.generation {
-            gpu.vertex_buffer = Some(device.create_buffer_init(
+            if mesh_upload_required(gpu.mesh_id.as_deref(), &data.mesh.id) {
+                gpu.position_buffer = Some(device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("BATSView positions"),
+                        contents: bytemuck::cast_slice(&data.mesh.positions),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    },
+                ));
+                gpu.index_buffer = Some(device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("BATSView indices"),
+                        contents: bytemuck::cast_slice(&data.mesh.indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    },
+                ));
+                gpu.index_count = data.mesh.indices.len().try_into().unwrap_or(u32::MAX);
+                gpu.mesh_id = Some(data.mesh.id.clone());
+            }
+            gpu.scalar_buffer = Some(device.create_buffer_init(
                 &wgpu::util::BufferInitDescriptor {
-                    label: Some("BATSView vertices"),
-                    contents: bytemuck::cast_slice(&data.vertices),
+                    label: Some("BATSView scalar values"),
+                    contents: bytemuck::cast_slice(&data.values),
                     usage: wgpu::BufferUsages::VERTEX,
                 },
             ));
-            gpu.index_buffer = Some(
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("BATSView indices"),
-                    contents: bytemuck::cast_slice(&data.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-            );
-            gpu.index_count = data.indices.len().try_into().unwrap_or(u32::MAX);
             gpu.generation = shared.generation;
         }
         let bounds = shared.display.view_bounds;
@@ -368,26 +394,33 @@ impl egui_wgpu::CallbackTrait for PlotCallback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         let gpu: &PlotResources = resources.get().expect("plot resources registered");
-        let (Some(vertices), Some(indices)) = (&gpu.vertex_buffer, &gpu.index_buffer) else {
+        let (Some(positions), Some(values), Some(indices)) =
+            (&gpu.position_buffer, &gpu.scalar_buffer, &gpu.index_buffer)
+        else {
             return;
         };
         render_pass.set_pipeline(&gpu.pipeline);
         render_pass.set_bind_group(0, &gpu.bind_group, &[]);
-        render_pass.set_vertex_buffer(0, vertices.slice(..));
+        render_pass.set_vertex_buffer(0, positions.slice(..));
+        render_pass.set_vertex_buffer(1, values.slice(..));
         render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
         render_pass.draw_indexed(0..gpu.index_count, 0, 0..1);
     }
 }
 
+fn mesh_upload_required(current: Option<&str>, next: &str) -> bool {
+    current != Some(next)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::PlotHeader;
+    use crate::protocol::{BRIDGE_PROTOCOL, MeshData, PlotHeader};
 
     fn plot_data() -> PlotData {
         PlotData {
             header: PlotHeader {
-                protocol: 1,
+                protocol: BRIDGE_PROTOCOL,
                 path: "test.plt".into(),
                 title: "test".into(),
                 section: Some("z=0".into()),
@@ -399,19 +432,25 @@ mod tests {
                 y_label: "Y".into(),
                 point_count: 0,
                 triangle_count: 0,
+                mesh_id: "00000000000000000000000000000000".into(),
+                mesh_included: true,
                 bounds: [-10.0, 10.0, -5.0, 5.0],
                 value_range: [1.0, 2.0],
                 positive_range: Some([1.0, 2.0]),
             },
-            vertices: Vec::new(),
-            indices: Vec::new(),
+            mesh: Arc::new(MeshData {
+                id: "00000000000000000000000000000000".into(),
+                positions: Vec::new(),
+                indices: Vec::new(),
+            }),
+            values: Vec::new(),
         }
     }
 
     #[test]
     fn view_uses_data_coordinates_for_pan_zoom_and_reset() {
         let mut plot = SharedPlot::default();
-        plot.set_data(plot_data());
+        plot.set_data(Arc::new(plot_data()));
         plot.zoom_view(0.5);
         assert_eq!(plot.display.view_bounds, [-5.0, 5.0, -2.5, 2.5]);
         plot.pan_view(0.1, -0.2);
@@ -419,7 +458,7 @@ mod tests {
         assert!(!plot.set_view_bounds([2.0, 1.0, -1.0, 1.0]));
         assert_eq!(plot.display.view_bounds, [-4.0, 6.0, -3.5, 1.5]);
         assert!(plot.set_view_bounds([-2.0, 2.0, -1.0, 1.0]));
-        plot.set_data(plot_data());
+        plot.set_data(Arc::new(plot_data()));
         assert_eq!(plot.display.view_bounds, [-2.0, 2.0, -1.0, 1.0]);
         plot.reset_view();
         assert_eq!(plot.display.view_bounds, [-10.0, 10.0, -5.0, 5.0]);
@@ -431,12 +470,19 @@ mod tests {
         let mut data = plot_data();
         data.header.value_range = [-5.0, 10.0];
         data.header.positive_range = Some([0.01, 10.0]);
-        plot.set_data(data);
+        plot.set_data(Arc::new(data));
         let appearance = AppearanceSettings {
             scale: Scale::Logarithmic,
             ..AppearanceSettings::default()
         };
         plot.set_appearance(&appearance);
         assert_eq!(plot.display.limits, [0.01, 10.0]);
+    }
+
+    #[test]
+    fn matching_mesh_id_skips_position_and_index_uploads() {
+        assert!(mesh_upload_required(None, "mesh-a"));
+        assert!(!mesh_upload_required(Some("mesh-a"), "mesh-a"));
+        assert!(mesh_upload_required(Some("mesh-a"), "mesh-b"));
     }
 }

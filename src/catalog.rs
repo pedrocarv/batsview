@@ -64,6 +64,28 @@ pub fn scan_directory(directory: &Path, recursive: bool) -> Result<ScanResult> {
     })
 }
 
+pub fn timeline_indices(files: &[PlotFile], selected_path: &str) -> Vec<usize> {
+    let Some(current) = files.iter().find(|file| file.path == selected_path) else {
+        return Vec::new();
+    };
+    let mut timeline: Vec<_> = files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            (file.section == current.section && file.var_id == current.var_id).then_some(index)
+        })
+        .collect();
+    timeline.sort_by(|left, right| {
+        let left = &files[*left];
+        let right = &files[*right];
+        left.time_step
+            .cmp(&right.time_step)
+            .then(left.dump_index.cmp(&right.dump_index))
+            .then(left.path.cmp(&right.path))
+    });
+    timeline
+}
+
 fn has_plt_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
@@ -130,5 +152,31 @@ mod tests {
         let recursive = scan_directory(root.path(), true).unwrap();
         assert_eq!(recursive.files.len(), 2);
         assert!(recursive.files.iter().any(|file| file.name == "custom.plt"));
+    }
+
+    #[test]
+    fn timeline_groups_section_and_variable_and_orders_frames() {
+        let file = |path: &str, section: &str, var_id: u64, time: u64, dump: u64| PlotFile {
+            path: path.into(),
+            name: path.into(),
+            size: 1,
+            section: Some(section.into()),
+            var_id: Some(var_id),
+            time_step: Some(time),
+            dump_index: Some(dump),
+        };
+        let files = vec![
+            file("late", "z=0", 1, 2, 3),
+            file("other-section", "y=0", 1, 1, 1),
+            file("early", "z=0", 1, 1, 2),
+            file("same-time-earlier-dump", "z=0", 1, 1, 1),
+            file("other-variable", "z=0", 2, 1, 1),
+        ];
+        let indices = timeline_indices(&files, "late");
+        let paths: Vec<_> = indices
+            .into_iter()
+            .map(|index| files[index].path.as_str())
+            .collect();
+        assert_eq!(paths, ["same-time-earlier-dump", "early", "late"]);
     }
 }

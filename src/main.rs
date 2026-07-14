@@ -8,10 +8,12 @@ mod app;
 mod bridge;
 mod catalog;
 mod export;
+mod loader;
 mod plot_ui;
 mod protocol;
 mod render;
 mod scene;
+mod streamlines;
 
 use app::ViewerApp;
 

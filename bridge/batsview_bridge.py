@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -17,8 +18,8 @@ import numpy as np
 import batsplot as bp
 
 
-PROTOCOL = 1
-MAGIC = b"BPV1"
+PROTOCOL = 2
+MAGIC = b"BPV2"
 
 
 def _default_cache_dir() -> Path:
@@ -37,6 +38,7 @@ def _default_cache_dir() -> Path:
 def _json(value: object) -> None:
     json.dump(value, sys.stdout, ensure_ascii=False, separators=(",", ":"))
     sys.stdout.write("\n")
+    sys.stdout.flush()
 
 
 def _record(path: Path) -> dict[str, Any]:
@@ -87,8 +89,7 @@ def _section(path: Path) -> str | None:
         return None
 
 
-def command_inspect(arguments: argparse.Namespace) -> None:
-    path = Path(arguments.input).expanduser()
+def _inspect(path: Path) -> dict[str, Any]:
     info = bp.inspect(path)
     config = bp.Config.default()
     aliases = config.aliases()
@@ -101,26 +102,28 @@ def command_inspect(arguments: argparse.Namespace) -> None:
         }
         for source in info.variables
     ]
-    _json(
-        {
-            "protocol": PROTOCOL,
-            "path": str(path.resolve()),
-            "title": info.title,
-            "section": _section(path),
-            "variables": variables,
-            "zones": [
-                {
-                    "index": zone.index,
-                    "name": zone.name,
-                    "num_points": zone.num_points,
-                    "num_elements": zone.num_elements,
-                    "zone_type": zone.zone_type,
-                    "value_locations": list(zone.value_locations),
-                }
-                for zone in info.zones
-            ],
-        }
-    )
+    return {
+        "protocol": PROTOCOL,
+        "path": str(path.resolve()),
+        "title": info.title,
+        "section": _section(path),
+        "variables": variables,
+        "zones": [
+            {
+                "index": zone.index,
+                "name": zone.name,
+                "num_points": zone.num_points,
+                "num_elements": zone.num_elements,
+                "zone_type": zone.zone_type,
+                "value_locations": list(zone.value_locations),
+            }
+            for zone in info.zones
+        ],
+    }
+
+
+def command_inspect(arguments: argparse.Namespace) -> None:
+    _json(_inspect(Path(arguments.input).expanduser()))
 
 
 def _coordinate_names(section: str | None, zone: bp.Zone) -> tuple[str, str]:
@@ -189,22 +192,40 @@ def _nodal_values(zone: bp.Zone, variable: str, triangles: np.ndarray, count: in
     return np.divide(sums, weights, out=np.full(count, np.nan), where=weights > 0)
 
 
-def command_export(arguments: argparse.Namespace) -> None:
-    path = Path(arguments.input).expanduser()
-    output = Path(arguments.output).expanduser()
+def _mesh_id(positions: np.ndarray, indices: np.ndarray) -> str:
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(struct.pack("<QQ", positions.shape[0], indices.shape[0]))
+    digest.update(positions.tobytes(order="C"))
+    digest.update(indices.tobytes(order="C"))
+    return digest.hexdigest()
+
+
+def _load_plot(
+    *,
+    input_path: str,
+    variable_name: str,
+    output_path: str,
+    zone_index: int = 0,
+    cache: bool = True,
+    cache_dir: str | Path | None = None,
+    reuse_mesh_id: str | None = None,
+) -> dict[str, Any]:
+    path = Path(input_path).expanduser()
+    output = Path(output_path).expanduser()
     section = _section(path)
     data = bp.read(
         path,
-        zone=arguments.zone,
-        variables=[arguments.variable],
+        zone=zone_index,
+        variables=[variable_name],
         include_connectivity=True,
-        cache=arguments.cache,
-        cache_dir=arguments.cache_dir,
+        cache=cache,
+        cache_dir=cache_dir or _default_cache_dir(),
     )
     zone = data.zone()
-    variable = bp.Config.default().canonical_name(bp.Config.default().source_name(arguments.variable))
+    config = bp.Config.default()
+    variable = config.canonical_name(config.source_name(variable_name))
     if variable not in zone.variables:
-        variable = arguments.variable
+        variable = variable_name
     x_name, y_name = _coordinate_names(section, zone)
     x = np.asarray(zone[x_name], dtype=np.float64).ravel()
     y = np.asarray(zone[y_name], dtype=np.float64).ravel()
@@ -215,10 +236,13 @@ def command_export(arguments: argparse.Namespace) -> None:
 
     finite = values[np.isfinite(values)]
     if finite.size == 0:
-        raise ValueError(f"Variable {arguments.variable!r} contains no finite values")
+        raise ValueError(f"Variable {variable_name!r} contains no finite values")
     positive = finite[finite > 0]
-    vertices = np.column_stack((x, y, values)).astype("<f4", copy=False)
+    positions = np.column_stack((x, y)).astype("<f4", copy=False)
+    scalar_values = values.astype("<f4", copy=False)
     indices = triangles.astype("<u4", copy=False)
+    mesh_id = _mesh_id(positions, indices)
+    mesh_included = reuse_mesh_id != mesh_id
     header = {
         "protocol": PROTOCOL,
         "path": str(path.resolve()),
@@ -226,12 +250,14 @@ def command_export(arguments: argparse.Namespace) -> None:
         "section": section,
         "zone": zone.name,
         "variable": variable,
-        "source_variable": zone.original_names.get(variable, arguments.variable),
+        "source_variable": zone.original_names.get(variable, variable_name),
         "unit": zone.units.get(variable),
         "x_label": x_name,
         "y_label": y_name,
-        "point_count": int(vertices.shape[0]),
+        "point_count": int(positions.shape[0]),
         "triangle_count": int(indices.shape[0]),
+        "mesh_id": mesh_id,
+        "mesh_included": mesh_included,
         "bounds": [float(np.nanmin(x)), float(np.nanmax(x)), float(np.nanmin(y)), float(np.nanmax(y))],
         "value_range": [float(finite.min()), float(finite.max())],
         "positive_range": [float(positive.min()), float(positive.max())] if positive.size else None,
@@ -243,10 +269,66 @@ def command_export(arguments: argparse.Namespace) -> None:
         stream.write(MAGIC)
         stream.write(struct.pack("<I", len(encoded)))
         stream.write(encoded)
-        stream.write(vertices.tobytes(order="C"))
-        stream.write(indices.tobytes(order="C"))
+        if mesh_included:
+            stream.write(positions.tobytes(order="C"))
+        stream.write(scalar_values.tobytes(order="C"))
+        if mesh_included:
+            stream.write(indices.tobytes(order="C"))
     temporary.replace(output)
-    _json({"protocol": PROTOCOL, "output": str(output.resolve()), **header})
+    return {"protocol": PROTOCOL, "output": str(output.resolve()), **header}
+
+
+def command_export(arguments: argparse.Namespace) -> None:
+    _json(
+        _load_plot(
+            input_path=arguments.input,
+            variable_name=arguments.variable,
+            output_path=arguments.output,
+            zone_index=arguments.zone,
+            cache=arguments.cache,
+            cache_dir=arguments.cache_dir,
+            reuse_mesh_id=arguments.reuse_mesh_id,
+        )
+    )
+
+
+def command_serve(_arguments: argparse.Namespace) -> None:
+    for line in sys.stdin:
+        request_id: object = None
+        try:
+            request = json.loads(line)
+            request_id = request.get("id")
+            if request.get("protocol") != PROTOCOL:
+                raise ValueError(f"Unsupported bridge protocol {request.get('protocol')!r}")
+            method = request.get("method")
+            parameters = request.get("params") or {}
+            if method == "inspect":
+                result = _inspect(Path(parameters["path"]).expanduser())
+            elif method == "load":
+                result = _load_plot(
+                    input_path=parameters["path"],
+                    variable_name=parameters["variable"],
+                    output_path=parameters["output"],
+                    zone_index=int(parameters.get("zone", 0)),
+                    cache=bool(parameters.get("cache", True)),
+                    cache_dir=parameters.get("cache_dir"),
+                    reuse_mesh_id=parameters.get("reuse_mesh_id"),
+                )
+            elif method == "shutdown":
+                _json({"protocol": PROTOCOL, "id": request_id, "ok": True, "result": {}})
+                break
+            else:
+                raise ValueError(f"Unknown bridge method {method!r}")
+            _json({"protocol": PROTOCOL, "id": request_id, "ok": True, "result": result})
+        except Exception as error:
+            _json(
+                {
+                    "protocol": PROTOCOL,
+                    "id": request_id,
+                    "ok": False,
+                    "error": {"type": type(error).__name__, "message": str(error)},
+                }
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -270,7 +352,11 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--zone", type=int, default=0)
     export.add_argument("--cache", action=argparse.BooleanOptionalAction, default=True)
     export.add_argument("--cache-dir", default=str(_default_cache_dir()))
+    export.add_argument("--reuse-mesh-id")
     export.set_defaults(handler=command_export)
+
+    serve = commands.add_parser("serve")
+    serve.set_defaults(handler=command_serve)
     return parser
 
 

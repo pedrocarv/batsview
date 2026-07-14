@@ -1,102 +1,249 @@
 # BATSView
 
-A fast, standalone desktop browser and 2-D viewer for BATS-R-US Tecplot files.
-The interface and renderer are native Rust. The existing Python `batsplot`
-package remains the single source of truth for TDV112 parsing and variable
-aliases through a small process boundary.
+[![CI](https://github.com/pedrocarv/batsview/actions/workflows/ci.yml/badge.svg)](https://github.com/pedrocarv/batsview/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Why this architecture
+BATSView is a fast, standalone desktop viewer for two-dimensional BATS-R-US
+Tecplot output. It combines run browsing, scientific plot styling, annotations,
+field-line visualization, and timestep playback in one focused application for
+Windows, Linux, and macOS.
 
-- `egui` provides one native UI codebase for Windows, Linux, and macOS.
-- `wgpu` uses DirectX 12, Vulkan, or Metal and keeps the finite-element mesh on
-  the GPU while the user pans, zooms, and changes display controls.
-- The bridge asks `batsplot` to read only the selected scalar and coordinates.
-- A compact, versioned `.bpv` exchange file avoids JSON encoding large arrays.
-- Bridge work runs outside the UI process, so a malformed or very large file
-  cannot freeze the interface.
+Packaged builds include everything required to read `.plt` files. End users do
+not need to install Python, Rust, or use a terminal.
 
-BATSView supports directory browsing, timestep navigation, metadata inspection,
-searchable source/canonical variable names, selective variable loading, editable
-axes, and GPU pan/zoom/reset. Its scientific plot workspace also provides:
+## Highlights
 
-- nine continuous or discrete colormaps with reversal and linear/log scaling;
-- automatic or exact colorbar ticks, custom labels, and numeric formatting;
-- template-based or fixed plot titles;
-- plot-coordinate lines, arrows, rectangles, circles/ellipses, polylines,
-  polygons, and text with direct center/size controls, editable handles,
-  styles, scopes, layers, and undo/redo;
-- per-run scene restoration plus portable scene JSON files; and
-- plot-only PNG export at 1x, 2x, or 4x with dark, white, or transparent
-  backgrounds.
+- Browse a complete BATS-R-US run and search files or variables by source and
+  canonical name.
+- Pan, zoom, fit, and set exact plot-axis limits on a GPU-accelerated canvas.
+- Choose from nine scientific colormaps, reverse or discretize them, and use
+  linear or logarithmic scaling.
+- Configure automatic or exact colorbar ticks, labels, number formatting, and
+  plot titles.
+- Add editable lines, arrows, rectangles, circles, ellipses, polylines,
+  polygons, and text in plot coordinates.
+- Draw optional two-dimensional streamtraces from any pair of nodal variables,
+  with a one-click magnetic-field setup, configurable seeds, and direction
+  arrows.
+- Step through or play a timestep series with adjustable frame rate and
+  looping.
+- Save reusable scenes and export clean, plot-only PNG images with dark, white,
+  or transparent backgrounds.
 
-Run discovery is performed natively without starting Python. Plot styling and
-annotation edits never reread or modify the source `.plt` files.
+BATSView never modifies source `.plt` files.
 
-## Controls
+## Download and install
 
-- Drag empty plot space to pan; use the wheel to zoom; double-click or press
-  `F` to fit the data.
-- Use the drawing toolbar above the plot to add figures. Hold Shift to constrain
-  lines, squares, and circles. Finish multi-point figures with Enter or a
-  double-click; Escape cancels a draft.
-- Drag a selected figure's blue center handle to move it. Rectangle corner and
-  ellipse radius handles resize it; the Annotations inspector also accepts
-  exact center, width/height, and circle radius values.
-- `Ctrl/Cmd+O` opens a run, `Ctrl/Cmd+S` saves a scene, `Ctrl/Cmd+E` exports a
-  PNG, and `Ctrl/Cmd+Z` / `Ctrl/Cmd+Shift+Z` undo and redo scene edits.
+Download the build for your platform from the
+[BATSView releases page](https://github.com/pedrocarv/batsview/releases).
 
-## Development
+| Platform | Package | Installation |
+| --- | --- | --- |
+| Windows 10/11, x86-64 | Setup `.exe` | Run the installer, then open BATSView from the Start menu. |
+| Linux, x86-64 | `.AppImage` | In the file properties, allow the file to run as a program, then double-click it. |
+| macOS, Apple silicon | `BATSView.app` in a `.zip` | Extract the archive and move BATSView to Applications. |
 
-Requirements:
+Current packages are unsigned. Windows SmartScreen or macOS Gatekeeper may ask
+you to confirm the first launch. On macOS, control-click BATSView, choose
+**Open**, and confirm when prompted.
 
-- Rust stable (1.85 or newer)
+## Quick start
+
+1. Open BATSView and select **Open run**.
+2. Choose the directory containing the BATS-R-US `.plt` files. Enable
+   **Include subfolders** when the run is organized into nested directories.
+3. Select a file in the run explorer.
+4. Choose a variable from the **Data** inspector. The plot updates while the
+   selected mesh is reused whenever possible.
+5. Drag empty plot space to pan, use the mouse wheel to zoom, and double-click
+   the plot or press `F` to fit the full domain.
+
+The transport strip beneath the plot becomes available when matching timesteps
+are found for the selected section and variable.
+
+## Workspace
+
+### Data
+
+Search and select variables, enter exact axis limits, fit or expand the view,
+and configure the in-memory plot cache. The default cache limit is 512 MiB and
+can be adjusted from 64 MiB to 8 GiB. **Clear cache** releases cached frames;
+it does not delete source data.
+
+### Style
+
+Control the scalar range, linear or logarithmic normalization, colormap,
+reversal, and discrete color bins. Colorbar ticks can be generated
+automatically or supplied as exact values with custom labels and fixed-decimal
+or scientific formatting.
+
+Plot titles may be fixed text or templates using metadata such as variable,
+unit, section, timestep, filename, run, and dataset title.
+
+### Shapes
+
+Use the toolbar above the plot to draw scientific annotations. Figures remain
+anchored in data coordinates while the view is panned or zoomed. Select a
+figure to move or resize it directly, or enter exact coordinates and dimensions
+in the inspector.
+
+Annotations support stroke and fill styling, dash patterns, arrowheads,
+visibility, locking, duplication, ordering, and run-, section-, variable-, or
+plot-specific scope. Scene edits support up to 100 undo/redo actions.
+
+### Fields
+
+Field lines are optional and are never added to a new plot automatically.
+
+- Select **Add magnetic field lines** to use the magnetic components aligned
+  with the current plot axes.
+- To visualize another vector field, select its horizontal and vertical
+  components and choose **Add custom field lines**.
+- Generate a uniform seed grid or activate **Place on plot** and click the
+  canvas to add individual seeds.
+- Configure integration direction, step size, maximum steps, line color and
+  width, and direction arrows.
+- Select **Hide** to remove the overlay while preserving its configuration.
+
+Field-line settings are stored per section. A previously saved scene restores
+field lines only when they were explicitly enabled in that scene.
+
+### Info
+
+Review source metadata, zone information, dimensions, variable aliases, units,
+and other details reported by the BATS-R-US file reader.
+
+## Timeline playback
+
+BATSView groups files with the same section and variable identifier into an
+ordered timeline. Use the controls below the canvas to move to the previous or
+next frame, scrub to a timestep, play or pause, select a rate from 0.5 to 30
+frames per second, and enable looping.
+
+Playback visits frames in order. If the next frame is not ready, the current
+frame remains visible and BATSView displays **Buffering** rather than skipping
+ahead. Neighboring frames are prefetched in the background.
+
+## Scenes and image export
+
+BATSView automatically remembers recent per-run scenes. Use **Save Scene** to
+write a portable JSON scene file and **Load Scene** to apply one to the current
+run. Scene paths are stored relatively so files can move between Windows and
+Linux systems with the same run layout.
+
+**Export PNG** writes only the scientific figure—not the surrounding
+application panels—and includes the title, axes, scalar field, colorbar,
+annotations, and visible field lines. Available output sizes are 1x, 2x, and 4x
+the current plot dimensions, with dark, publication-white, or transparent
+backgrounds.
+
+## Keyboard and mouse controls
+
+| Action | Control |
+| --- | --- |
+| Open a run | `Ctrl+O` / `Cmd+O` |
+| Save a scene | `Ctrl+S` / `Cmd+S` |
+| Export a PNG | `Ctrl+E` / `Cmd+E` |
+| Undo / redo | `Ctrl+Z` / `Ctrl+Shift+Z` or `Cmd+Z` / `Cmd+Shift+Z` |
+| Fit the plot | `F` or double-click the canvas |
+| Pan | Drag empty plot space |
+| Zoom | Mouse wheel |
+| Play / pause | `Space` when a text field is not active |
+| Delete a selected annotation | `Delete` / `Backspace` |
+| Cancel drawing or seed placement | `Escape` |
+| Constrain a line, square, or circle | Hold `Shift` while drawing |
+| Finish a polyline or polygon | `Enter` or double-click |
+
+## Performance
+
+BATSView is designed for large simulation outputs:
+
+- one persistent reader process serves the entire application session;
+- a byte-limited least-recently-used cache retains recently viewed frames;
+- identical meshes and connectivity are shared across variables and timesteps;
+- matching GPU meshes update only their scalar buffer;
+- neighboring timeline frames load in the background; and
+- superseded requests are cancelled so rapid selections cannot display stale
+  results.
+
+The first access to a large mesh may still take time. Subsequent variables and
+timesteps on the same grid are normally much faster.
+
+## Troubleshooting
+
+### No files appear after opening a run
+
+Confirm that the selected directory contains files ending in `.plt`. If the
+files are below the selected directory, enable **Include subfolders**. Extension
+matching is case-insensitive.
+
+### Field lines are not visible
+
+Open **Fields** and explicitly add a magnetic or custom vector field. Confirm
+that two different nodal components are selected and that the seed list is not
+empty. Field lines remain off until an overlay is added.
+
+### Playback is buffering
+
+Large frames may need additional time on first access. Allow the next frame to
+finish loading, reduce the playback rate, or increase the memory-cache limit if
+the computer has sufficient RAM.
+
+### The operating system blocks the application
+
+The current packages are unsigned. Use the platform-specific first-launch
+confirmation described in [Download and install](#download-and-install). Only
+install builds obtained from the official BATSView repository.
+
+## For contributors
+
+BATSView's interface and renderer are written in Rust using `egui` and `wgpu`.
+A supervised Python bridge uses
+[`batsplot`](https://github.com/pedrocarv/batsplot) as the source of truth for
+TDV112 parsing and variable aliases. Packaged applications bundle this bridge;
+the following dependencies are required only for development.
+
+### Requirements
+
+- Rust stable 1.85 or newer
 - Python 3.10 or newer
 - A local or installed copy of `batsplot`
 
-From this directory:
+### Run from source
 
 ```bash
-# When batsplot is installed in the current Python environment:
+# When batsplot is installed in the active Python environment
 cargo run --release
 
-# Or point the bridge at a batsplot checkout:
+# Or point BATSView at a batsplot checkout
 BATSPLOT_SOURCE=/path/to/batsplot/src cargo run --release
 
-# Open a run directory or one .plt file immediately:
+# Open a run directory or one .plt file immediately
 cargo run --release -- /path/to/run
 ```
 
-The viewer honors these environment variables:
+Development environment variables:
 
-- `BATSVIEW_BRIDGE`: path to a packaged bridge executable.
-- `BATSVIEW_PYTHON`: Python executable used in development (default: `python3`,
-  with `python` as the Windows fallback).
+- `BATSVIEW_BRIDGE`: packaged bridge executable or directory.
+- `BATSVIEW_PYTHON`: Python executable used in development; defaults to
+  `python3`, with `python` as the Windows fallback.
 - `BATSPLOT_SOURCE`: directory prepended to `PYTHONPATH`, normally the
-  `batsplot` repository's `src` directory.
-- `BATSVIEW_CACHE_DIR`: optional override for the persistent reader cache.
+  `batsplot` checkout's `src` directory.
+- `BATSVIEW_CACHE_DIR`: optional persistent reader-cache location.
 
-## End-user installation
+### Test
 
-GitHub Actions artifacts are native desktop packages. Users do not need a
-terminal, Rust, or Python:
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+python -m pytest -q
+```
 
-- macOS: open `BATSView.app` from Finder (normally move it to Applications);
-- Windows: run the BATSView setup `.exe`, then launch it from the Start menu;
-- Linux: mark the `.AppImage` executable once, then open it from the desktop or
-  file manager.
+CI runs the Rust suite on Windows, Linux, and macOS and runs the bridge tests on
+Python 3.12.
 
-The installed app includes the platform-specific Python bridge and `batsplot`.
-The directory-form bridge avoids the extraction delay paid by one-file Python
-bundles on every selective read. BATSView also registers `.plt` files so an
-installed copy can open them directly.
-
-The initial packages are unsigned. macOS Gatekeeper and Windows SmartScreen may
-therefore ask the user to confirm the first launch. Production releases should
-be code-signed (and notarized on macOS).
-
-## Building a desktop package
-
-Install the build requirements, then run the cross-platform packaging helper:
+### Build a desktop package
 
 ```bash
 python -m pip install -r bridge/requirements-build.txt
@@ -104,30 +251,41 @@ cargo install cargo-packager --locked --version 0.11.8
 python scripts/package.py
 ```
 
-The default output is a macOS `.app`, Windows NSIS installer `.exe`, or Linux
-`.AppImage`. Pass `--format dmg`, `--format wix`, or `--format deb` to request
-one of the other supported native formats. Outputs are written under
-`target/release/`.
+The default output is a Windows NSIS installer, Linux AppImage, or macOS
+application bundle under `target/release`. Use `python scripts/package.py
+--help` to list additional package formats.
 
-## Bridge protocol
-
-The bridge's control plane is JSON on stdout. Plot data uses `BPV1`, a compact
-little-endian file:
-
-1. four-byte ASCII magic `BPV1`;
-2. unsigned 32-bit JSON header length;
-3. UTF-8 JSON header;
-4. interleaved point vertices (`x`, `y`, `value`) as `float32`;
-5. triangle indices as `uint32`.
-
-The header records counts, labels, value ranges, and bounds. New protocol
-versions must use a new magic value so incompatible readers fail clearly.
-
-## Linux packages
-
-Building `eframe` on Debian/Ubuntu typically needs:
+Building on Debian or Ubuntu requires the native window-system packages:
 
 ```bash
 sudo apt-get install build-essential pkg-config libx11-dev libxkbcommon-dev \
   libwayland-dev libgl1-mesa-dev
 ```
+
+<details>
+<summary>Bridge protocol</summary>
+
+The persistent bridge control plane uses newline-delimited JSON over standard
+input and output. Requests include protocol version 2, a numeric request ID, a
+method (`inspect`, `load`, or `shutdown`), and parameters. Responses echo the
+request ID and contain either a result or a structured error. One-shot commands
+remain available for diagnostics.
+
+Plot data uses the little-endian `BPV2` exchange format:
+
+1. four-byte ASCII magic `BPV2`;
+2. unsigned 32-bit JSON-header length;
+3. UTF-8 JSON header;
+4. optional float32 positions;
+5. float32 scalar values; and
+6. optional uint32 triangle indices.
+
+The header records a stable mesh ID, mesh-presence flag, counts, labels, value
+ranges, and bounds. When a request supplies a matching mesh ID, the bridge
+writes only the scalar values.
+
+</details>
+
+## License
+
+BATSView is available under the [MIT License](LICENSE).

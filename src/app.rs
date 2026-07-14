@@ -1,11 +1,9 @@
 use std::{
-    collections::hash_map::DefaultHasher,
     fs,
-    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -17,15 +15,20 @@ use serde::{Deserialize, Serialize};
 use crate::{
     annotations::{AnnotationEditor, DrawingTool},
     bridge::Bridge,
-    catalog::scan_directory,
+    catalog::{scan_directory, timeline_indices},
     export::{ExportBackground, ExportFrame, ExportSettings, render_plot_png},
+    loader::{CacheStats, LoaderEvent, PlotKey, PlotLoader, RequestPriority},
     plot_ui::{PlotChrome, PlotColors, fit_plot_rect, paint_plot_chrome, sample_appearance},
-    protocol::{FileInfo, PlotData, PlotFile, ScanResult, read_plot},
+    protocol::{BRIDGE_PROTOCOL, FileInfo, PlotData, PlotFile, ScanResult},
     render::{PlotCallback, PlotHandle, PlotResources, SharedPlot},
     scene::{
         AnnotationGeometry, AnnotationScope, AppearanceSettings, ColorMode, ColorbarTick, Colormap,
-        DashStyle, NumberFormat, RgbaColor, Scale, SceneDocument, ScopeContext, TickMode,
-        TitleConfig, TitleContext, render_title, validate_custom_ticks,
+        DashStyle, DataPoint, NumberFormat, RgbaColor, Scale, SceneDocument, ScopeContext,
+        StreamlineDirection, TickMode, TitleConfig, TitleContext, render_title,
+        validate_custom_ticks,
+    },
+    streamlines::{
+        StreamlineOverlay, VectorField, paint_streamlines, screen_to_data as streamline_seed_point,
     },
 };
 
@@ -35,17 +38,23 @@ const PANEL_BG: Color32 = Color32::from_rgb(15, 22, 31);
 const DEEP_BG: Color32 = Color32::from_rgb(9, 14, 21);
 const MUTED: Color32 = Color32::from_rgb(145, 158, 173);
 
+const fn default_cache_limit_mib() -> u32 {
+    512
+}
+
+const fn default_playback_fps() -> f32 {
+    5.0
+}
+
+fn mib_to_bytes(value: u32) -> usize {
+    value as usize * 1024 * 1024
+}
+
 enum Event {
     DirectoryChosen(Option<PathBuf>),
-    Scan(Result<ScanResult>),
-    Inspect {
-        path: String,
-        result: Result<FileInfo>,
-    },
-    Plot {
-        path: String,
-        variable: String,
-        result: Box<Result<PlotData>>,
+    Scan {
+        epoch: u64,
+        result: Result<ScanResult>,
     },
     SceneSaved(Result<Option<PathBuf>>),
     SceneLoaded(Result<Option<(PathBuf, SceneDocument)>>),
@@ -54,6 +63,14 @@ enum Event {
         settings: ExportSettings,
     },
     ImageSaved(Result<PathBuf>),
+    StreamlinesComputed {
+        generation: u64,
+        path: String,
+        section: Option<String>,
+        horizontal_component: String,
+        vertical_component: String,
+        result: Result<(Arc<VectorField>, Vec<Vec<DataPoint>>)>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -62,14 +79,16 @@ enum InspectorTab {
     Data,
     Appearance,
     Annotations,
+    FieldLines,
     Metadata,
 }
 
 impl InspectorTab {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Data,
         Self::Appearance,
         Self::Annotations,
+        Self::FieldLines,
         Self::Metadata,
     ];
 
@@ -78,7 +97,18 @@ impl InspectorTab {
             Self::Data => "Data",
             Self::Appearance => "Appearance",
             Self::Annotations => "Annotations",
+            Self::FieldLines => "Field lines",
             Self::Metadata => "Metadata",
+        }
+    }
+
+    fn short_name(self) -> &'static str {
+        match self {
+            Self::Data => "Data",
+            Self::Appearance => "Style",
+            Self::Annotations => "Shapes",
+            Self::FieldLines => "Fields",
+            Self::Metadata => "Info",
         }
     }
 }
@@ -89,6 +119,31 @@ enum ToolbarIcon {
     FitView,
     Undo,
     Redo,
+    StreamlineSeed,
+    Previous,
+    Play,
+    Pause,
+    Next,
+}
+
+struct PendingStreamlineLoad {
+    generation: u64,
+    path: String,
+    section: Option<String>,
+    horizontal_component: String,
+    vertical_component: String,
+    horizontal_request: u64,
+    vertical_request: u64,
+    horizontal: Option<Arc<PlotData>>,
+    vertical: Option<Arc<PlotData>>,
+}
+
+struct ActiveVectorField {
+    path: String,
+    section: Option<String>,
+    horizontal_component: String,
+    vertical_component: String,
+    field: Arc<VectorField>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -98,16 +153,34 @@ struct StoredRunScene {
     scene: SceneDocument,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct PersistedAppState {
     #[serde(default)]
     recursive: bool,
     #[serde(default)]
     recent_runs: Vec<StoredRunScene>,
+    #[serde(default = "default_cache_limit_mib")]
+    cache_limit_mib: u32,
+    #[serde(default = "default_playback_fps")]
+    playback_fps: f32,
+    #[serde(default)]
+    playback_loop: bool,
+}
+
+impl Default for PersistedAppState {
+    fn default() -> Self {
+        Self {
+            recursive: false,
+            recent_runs: Vec::new(),
+            cache_limit_mib: default_cache_limit_mib(),
+            playback_fps: default_playback_fps(),
+            playback_loop: false,
+        }
+    }
 }
 
 pub struct ViewerApp {
-    bridge: Bridge,
+    loader: PlotLoader,
     sender: mpsc::Sender<Event>,
     receiver: mpsc::Receiver<Event>,
     plot: PlotHandle,
@@ -115,8 +188,11 @@ pub struct ViewerApp {
     recursive: bool,
     files: Vec<PlotFile>,
     selected_path: Option<String>,
+    displayed_path: Option<String>,
     info: Option<FileInfo>,
+    displayed_info: Option<FileInfo>,
     selected_variable: Option<String>,
+    displayed_variable: Option<String>,
     file_filter: String,
     variable_filter: String,
     choosing_run: bool,
@@ -132,6 +208,25 @@ pub struct ViewerApp {
     export_settings: ExportSettings,
     render_state: Option<eframe::egui_wgpu::RenderState>,
     last_export_rect: Option<egui::Rect>,
+    load_epoch: u64,
+    active_inspect_request: Option<u64>,
+    active_plot_request: Option<u64>,
+    cache_limit_mib: u32,
+    cache_stats: CacheStats,
+    playback_fps: f32,
+    playback_loop: bool,
+    playing: bool,
+    buffering: bool,
+    next_frame_at: Option<Instant>,
+    scrub_target: Option<usize>,
+    scrub_changed_at: Option<Instant>,
+    pending_streamlines: Option<PendingStreamlineLoad>,
+    vector_field: Option<ActiveVectorField>,
+    streamline_overlay: Option<StreamlineOverlay>,
+    streamline_generation: u64,
+    streamline_loading: bool,
+    streamline_error: Option<String>,
+    placing_streamline_seed: bool,
 }
 
 impl ViewerApp {
@@ -154,18 +249,27 @@ impl ViewerApp {
             .storage
             .and_then(|storage| eframe::get_value(storage, APP_STORAGE_KEY))
             .unwrap_or_default();
+        let cache_limit_mib = persisted.cache_limit_mib.clamp(64, 8192);
+        let playback_fps = persisted.playback_fps.clamp(0.5, 30.0);
+        let playback_loop = persisted.playback_loop;
+        let recursive = persisted.recursive;
+        let stored_runs = persisted.recent_runs;
+        let loader = PlotLoader::new(Bridge::discover(), mib_to_bytes(cache_limit_mib));
         let (sender, receiver) = mpsc::channel();
         let mut app = Self {
-            bridge: Bridge::discover(),
+            loader,
             sender,
             receiver,
             plot,
             directory: None,
-            recursive: persisted.recursive,
+            recursive,
             files: Vec::new(),
             selected_path: None,
+            displayed_path: None,
             info: None,
+            displayed_info: None,
             selected_variable: None,
+            displayed_variable: None,
             file_filter: String::new(),
             variable_filter: String::new(),
             choosing_run: false,
@@ -173,7 +277,7 @@ impl ViewerApp {
             io_busy: false,
             status: "Choose a BATS-R-US output directory to begin".to_owned(),
             scene: SceneDocument::default(),
-            stored_runs: persisted.recent_runs,
+            stored_runs,
             current_run_key: None,
             editor: AnnotationEditor::default(),
             inspector_tab: InspectorTab::Data,
@@ -181,6 +285,28 @@ impl ViewerApp {
             export_settings: ExportSettings::default(),
             render_state: context.wgpu_render_state.clone(),
             last_export_rect: None,
+            load_epoch: 1,
+            active_inspect_request: None,
+            active_plot_request: None,
+            cache_limit_mib,
+            cache_stats: CacheStats {
+                limit_bytes: mib_to_bytes(cache_limit_mib),
+                ..CacheStats::default()
+            },
+            playback_fps,
+            playback_loop,
+            playing: false,
+            buffering: false,
+            next_frame_at: None,
+            scrub_target: None,
+            scrub_changed_at: None,
+            pending_streamlines: None,
+            vector_field: None,
+            streamline_overlay: None,
+            streamline_generation: 1,
+            streamline_loading: false,
+            streamline_error: None,
+            placing_streamline_seed: false,
         };
         if let Some(path) = initial_path {
             if path.is_dir() {
@@ -214,60 +340,90 @@ impl ViewerApp {
     }
 
     fn scan(&mut self, directory: PathBuf) {
+        let directory = directory.canonicalize().unwrap_or(directory);
+        self.load_epoch = self.load_epoch.wrapping_add(1);
+        self.pause_playback();
         self.directory = Some(directory.clone());
         self.files.clear();
         self.info = None;
+        self.displayed_info = None;
         self.selected_path = None;
+        self.displayed_path = None;
         self.selected_variable = None;
+        self.displayed_variable = None;
+        self.active_inspect_request = None;
+        self.active_plot_request = None;
+        self.loader.cancel_auxiliary();
+        self.pending_streamlines = None;
+        self.vector_field = None;
+        self.streamline_overlay = None;
+        self.streamline_loading = false;
+        self.streamline_error = None;
+        self.placing_streamline_seed = false;
+        self.plot.lock().unwrap().clear_data();
         self.loading = true;
         self.status = format!("Scanning {}…", directory.display());
         let sender = self.sender.clone();
         let recursive = self.recursive;
+        let epoch = self.load_epoch;
         thread::spawn(move || {
-            let _ = sender.send(Event::Scan(scan_directory(&directory, recursive)));
-        });
-    }
-
-    fn inspect(&mut self, path: String) {
-        self.selected_path = Some(path.clone());
-        self.info = None;
-        self.selected_variable = None;
-        self.loading = true;
-        self.status = "Inspecting metadata…".to_owned();
-        let bridge = self.bridge.clone();
-        let sender = self.sender.clone();
-        let request_path = path.clone();
-        thread::spawn(move || {
-            let result = bridge.inspect(Path::new(&request_path));
-            let _ = sender.send(Event::Inspect { path, result });
-        });
-    }
-
-    fn load_variable(&mut self, variable: String) {
-        let Some(path) = self.selected_path.clone() else {
-            return;
-        };
-        self.selected_variable = Some(variable.clone());
-        self.loading = true;
-        self.status = format!("Loading {variable}…");
-        let bridge = self.bridge.clone();
-        let sender = self.sender.clone();
-        let request_path = path.clone();
-        let request_variable = variable.clone();
-        thread::spawn(move || {
-            let output = exchange_path(&request_path, &request_variable);
-            let result = bridge
-                .export(Path::new(&request_path), &request_variable, &output)
-                .and_then(|()| read_plot(&output));
-            let _ = sender.send(Event::Plot {
-                path,
-                variable,
-                result: Box::new(result),
+            let _ = sender.send(Event::Scan {
+                epoch,
+                result: scan_directory(&directory, recursive),
             });
         });
     }
 
+    fn inspect(&mut self, path: String) {
+        let path = Path::new(&path)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(&path))
+            .to_string_lossy()
+            .into_owned();
+        self.pause_playback();
+        self.selected_path = Some(path.clone());
+        self.info = None;
+        self.loading = true;
+        self.status = "Inspecting metadata…".to_owned();
+        self.active_plot_request = None;
+        self.active_inspect_request = Some(self.loader.inspect(self.load_epoch, path.into()));
+    }
+
+    fn load_variable(&mut self, variable: String) {
+        self.pause_playback();
+        self.selected_variable = Some(variable.clone());
+        self.request_selected_plot(variable);
+    }
+
+    fn request_selected_plot(&mut self, variable: String) {
+        let Some(path) = self.selected_path.clone() else {
+            return;
+        };
+        let Ok(key) = PlotKey::for_file(&path, variable.clone(), 0) else {
+            self.fail(format!("Could not read metadata for {path}"));
+            return;
+        };
+        let reuse_mesh = self
+            .plot
+            .lock()
+            .unwrap()
+            .data
+            .as_ref()
+            .map(|data| data.mesh.clone());
+        let request_id = self.loader.load(
+            self.load_epoch,
+            key,
+            RequestPriority::Foreground,
+            reuse_mesh,
+        );
+        self.active_plot_request = Some(request_id);
+        self.active_inspect_request = None;
+        self.loading = true;
+        self.status = format!("Loading {variable}…");
+    }
+
     fn poll_events(&mut self, context: &egui::Context) {
+        self.poll_loader_events();
         while let Ok(event) = self.receiver.try_recv() {
             match event {
                 Event::DirectoryChosen(Some(directory)) => {
@@ -278,7 +434,7 @@ impl ViewerApp {
                     self.choosing_run = false;
                     self.status = "Run selection canceled".to_owned();
                 }
-                Event::Scan(result) => match result {
+                Event::Scan { epoch, result } if epoch == self.load_epoch => match result {
                     Ok(scan) if scan.protocol == 1 => {
                         self.activate_scene(scan.directory.clone());
                         self.files = scan.files;
@@ -292,49 +448,6 @@ impl ViewerApp {
                     Ok(scan) => self.fail(format!("Unsupported bridge protocol {}", scan.protocol)),
                     Err(error) => self.fail(error.to_string()),
                 },
-                Event::Inspect { path, result } if self.selected_path.as_deref() == Some(&path) => {
-                    match result {
-                        Ok(info) if info.protocol == 1 => {
-                            let first_scalar = info
-                                .variables
-                                .iter()
-                                .find(|variable| {
-                                    !is_coordinate(&variable.source)
-                                        && !is_coordinate(&variable.canonical)
-                                })
-                                .map(|variable| variable.canonical.clone());
-                            self.info = Some(info);
-                            self.loading = false;
-                            self.status = "Metadata ready".to_owned();
-                            if let Some(variable) = first_scalar {
-                                self.load_variable(variable);
-                            }
-                        }
-                        Ok(info) => {
-                            self.fail(format!("Unsupported bridge protocol {}", info.protocol))
-                        }
-                        Err(error) => self.fail(error.to_string()),
-                    }
-                }
-                Event::Plot {
-                    path,
-                    variable,
-                    result,
-                } if self.selected_path.as_deref() == Some(&path)
-                    && self.selected_variable.as_deref() == Some(&variable) =>
-                {
-                    match *result {
-                        Ok(data) => {
-                            let points = data.header.point_count;
-                            let triangles = data.header.triangle_count;
-                            self.plot.lock().unwrap().set_data(data);
-                            self.sync_plot_appearance();
-                            self.loading = false;
-                            self.status = format!("{points} points · {triangles} triangles");
-                        }
-                        Err(error) => self.fail(error.to_string()),
-                    }
-                }
                 Event::SceneSaved(result) => {
                     self.io_busy = false;
                     match result {
@@ -351,6 +464,7 @@ impl ViewerApp {
                             self.scene = scene;
                             self.editor.selected = None;
                             self.sync_plot_appearance();
+                            self.request_streamlines_for_display();
                             self.status = format!("Scene loaded · {}", path.display());
                         }
                         Ok(None) => self.status = "Scene load canceled".to_owned(),
@@ -386,7 +500,165 @@ impl ViewerApp {
                         Err(error) => self.fail(error.to_string()),
                     }
                 }
+                Event::StreamlinesComputed {
+                    generation,
+                    path,
+                    section,
+                    horizontal_component,
+                    vertical_component,
+                    result,
+                } if generation == self.streamline_generation
+                    && self.displayed_path.as_deref() == Some(path.as_str()) =>
+                {
+                    let settings = self.scene.streamlines_for(section.as_deref());
+                    if !settings.enabled
+                        || settings.horizontal_component.as_deref()
+                            != Some(horizontal_component.as_str())
+                        || settings.vertical_component.as_deref()
+                            != Some(vertical_component.as_str())
+                    {
+                        continue;
+                    }
+                    self.streamline_loading = false;
+                    match result {
+                        Ok((field, lines)) => {
+                            self.vector_field = Some(ActiveVectorField {
+                                path: path.clone(),
+                                section: section.clone(),
+                                horizontal_component: horizontal_component.clone(),
+                                vertical_component: vertical_component.clone(),
+                                field,
+                            });
+                            self.streamline_overlay = Some(StreamlineOverlay {
+                                path,
+                                section,
+                                horizontal_component,
+                                vertical_component,
+                                lines,
+                                settings,
+                            });
+                            self.streamline_error = None;
+                        }
+                        Err(error) => {
+                            self.streamline_overlay = None;
+                            self.streamline_error = Some(error.to_string());
+                        }
+                    }
+                }
                 _ => {}
+            }
+        }
+    }
+
+    fn poll_loader_events(&mut self) {
+        while let Ok(event) = self.loader.try_recv() {
+            match event {
+                LoaderEvent::CacheStats(stats) => self.cache_stats = stats,
+                LoaderEvent::Inspected {
+                    request_id,
+                    epoch,
+                    path,
+                    result,
+                } if epoch == self.load_epoch
+                    && self.active_inspect_request == Some(request_id)
+                    && self.selected_path.as_deref() == path.to_str() =>
+                {
+                    self.active_inspect_request = None;
+                    match result {
+                        Ok(info) if info.protocol == BRIDGE_PROTOCOL => {
+                            let preserved = self.selected_variable.as_ref().and_then(|selected| {
+                                info.variables
+                                    .iter()
+                                    .find(|variable| {
+                                        &variable.canonical == selected
+                                            && !is_coordinate(&variable.canonical)
+                                    })
+                                    .map(|variable| variable.canonical.clone())
+                            });
+                            let variable = preserved.or_else(|| {
+                                info.variables
+                                    .iter()
+                                    .find(|variable| {
+                                        !is_coordinate(&variable.source)
+                                            && !is_coordinate(&variable.canonical)
+                                    })
+                                    .map(|variable| variable.canonical.clone())
+                            });
+                            self.info = Some(info);
+                            if let Some(variable) = variable {
+                                self.selected_variable = Some(variable.clone());
+                                self.request_selected_plot(variable);
+                            } else {
+                                self.loading = false;
+                                self.status = "No scalar variables found".to_owned();
+                            }
+                        }
+                        Ok(info) => {
+                            self.fail(format!("Unsupported bridge protocol {}", info.protocol))
+                        }
+                        Err(error) => self.fail(error),
+                    }
+                }
+                LoaderEvent::Plot {
+                    request_id,
+                    epoch,
+                    key,
+                    priority: RequestPriority::Foreground,
+                    from_cache,
+                    result,
+                } if epoch == self.load_epoch
+                    && self.active_plot_request == Some(request_id)
+                    && self.selected_path.as_deref() == key.path.to_str()
+                    && self.selected_variable.as_deref() == Some(&key.variable) =>
+                {
+                    self.active_plot_request = None;
+                    match result {
+                        Ok(data) => {
+                            let points = data.header.point_count;
+                            let triangles = data.header.triangle_count;
+                            self.displayed_path = Some(key.path.to_string_lossy().into_owned());
+                            self.displayed_variable = Some(key.variable);
+                            if self
+                                .info
+                                .as_ref()
+                                .is_some_and(|info| Path::new(&info.path) == key.path.as_path())
+                            {
+                                self.displayed_info = self.info.clone();
+                            } else if let Some(info) = &mut self.displayed_info {
+                                info.path = key.path.to_string_lossy().into_owned();
+                                info.title = data.header.title.clone();
+                                info.section = data.header.section.clone();
+                            }
+                            self.plot.lock().unwrap().set_data(data);
+                            self.sync_plot_appearance();
+                            self.loading = false;
+                            self.buffering = false;
+                            self.next_frame_at =
+                                self.playing.then(|| Instant::now() + self.frame_duration());
+                            self.status = if from_cache {
+                                format!("{points} points · {triangles} triangles · cached")
+                            } else {
+                                format!("{points} points · {triangles} triangles")
+                            };
+                            self.request_streamlines_for_display();
+                            self.schedule_prefetch();
+                        }
+                        Err(error) => {
+                            self.pause_playback();
+                            self.fail(error);
+                        }
+                    }
+                }
+                LoaderEvent::Plot {
+                    request_id,
+                    epoch,
+                    priority: RequestPriority::Overlay,
+                    result,
+                    ..
+                } if epoch == self.load_epoch => {
+                    self.accept_streamline_component(request_id, result);
+                }
+                LoaderEvent::Plot { .. } | LoaderEvent::Inspected { .. } => {}
             }
         }
     }
@@ -394,12 +666,201 @@ impl ViewerApp {
     fn fail(&mut self, message: String) {
         self.loading = false;
         self.io_busy = false;
+        self.buffering = false;
         self.status = format!("Error: {message}");
     }
 
     fn sync_plot_appearance(&mut self) {
-        let appearance = self.scene.appearance_for(self.selected_variable.as_deref());
+        let appearance = self
+            .scene
+            .appearance_for(self.displayed_variable.as_deref());
         self.plot.lock().unwrap().set_appearance(&appearance);
+    }
+
+    fn request_streamlines_for_display(&mut self) {
+        self.streamline_generation = self.streamline_generation.wrapping_add(1).max(1);
+        self.loader.cancel_auxiliary();
+        self.pending_streamlines = None;
+        self.vector_field = None;
+        self.streamline_overlay = None;
+        self.streamline_loading = false;
+        self.streamline_error = None;
+
+        let Some(path) = self.displayed_path.clone() else {
+            return;
+        };
+        let data = self.plot.lock().unwrap().data.clone();
+        let Some(data) = data else { return };
+        let section = data.header.section.clone();
+        let settings = self.scene.streamlines_for(section.as_deref());
+        if !settings.enabled {
+            self.placing_streamline_seed = false;
+            return;
+        }
+        let (Some(horizontal_component), Some(vertical_component)) = (
+            settings.horizontal_component.clone(),
+            settings.vertical_component.clone(),
+        ) else {
+            self.streamline_error = Some("Choose both vector components".to_owned());
+            return;
+        };
+        if horizontal_component == vertical_component {
+            self.streamline_error = Some("Vector components must be different".to_owned());
+            return;
+        }
+        let horizontal_key = match PlotKey::for_file(&path, horizontal_component.clone(), 0) {
+            Ok(key) => key,
+            Err(error) => {
+                self.streamline_error = Some(error);
+                return;
+            }
+        };
+        let vertical_key = match PlotKey::for_file(&path, vertical_component.clone(), 0) {
+            Ok(key) => key,
+            Err(error) => {
+                self.streamline_error = Some(error);
+                return;
+            }
+        };
+        let reuse_mesh = Some(data.mesh.clone());
+        let horizontal_request = self.loader.load(
+            self.load_epoch,
+            horizontal_key,
+            RequestPriority::Overlay,
+            reuse_mesh.clone(),
+        );
+        let vertical_request = self.loader.load(
+            self.load_epoch,
+            vertical_key,
+            RequestPriority::Overlay,
+            reuse_mesh,
+        );
+        self.pending_streamlines = Some(PendingStreamlineLoad {
+            generation: self.streamline_generation,
+            path,
+            section,
+            horizontal_component,
+            vertical_component,
+            horizontal_request,
+            vertical_request,
+            horizontal: None,
+            vertical: None,
+        });
+        self.streamline_loading = true;
+    }
+
+    fn accept_streamline_component(
+        &mut self,
+        request_id: u64,
+        result: Result<Arc<PlotData>, String>,
+    ) {
+        let mut ready = None;
+        let mut failed = None;
+        if let Some(pending) = &mut self.pending_streamlines {
+            let target = if pending.horizontal_request == request_id {
+                Some(&mut pending.horizontal)
+            } else if pending.vertical_request == request_id {
+                Some(&mut pending.vertical)
+            } else {
+                None
+            };
+            if let Some(target) = target {
+                match result {
+                    Ok(data) => *target = Some(data),
+                    Err(error) => failed = Some(error),
+                }
+                if failed.is_none()
+                    && let (Some(horizontal), Some(vertical)) =
+                        (pending.horizontal.clone(), pending.vertical.clone())
+                {
+                    ready = Some((
+                        pending.generation,
+                        pending.path.clone(),
+                        pending.section.clone(),
+                        pending.horizontal_component.clone(),
+                        pending.vertical_component.clone(),
+                        horizontal,
+                        vertical,
+                    ));
+                }
+            }
+        }
+        if let Some(error) = failed {
+            self.pending_streamlines = None;
+            self.streamline_loading = false;
+            self.streamline_error = Some(error);
+        } else if let Some((
+            generation,
+            path,
+            section,
+            horizontal_name,
+            vertical_name,
+            horizontal,
+            vertical,
+        )) = ready
+        {
+            self.pending_streamlines = None;
+            let settings = self.scene.streamlines_for(section.as_deref());
+            let sender = self.sender.clone();
+            thread::spawn(move || {
+                let result = VectorField::new(horizontal, vertical).map(|field| {
+                    let field = Arc::new(field);
+                    let lines = field.integrate(&settings);
+                    (field, lines)
+                });
+                let _ = sender.send(Event::StreamlinesComputed {
+                    generation,
+                    path,
+                    section,
+                    horizontal_component: horizontal_name,
+                    vertical_component: vertical_name,
+                    result,
+                });
+            });
+        }
+    }
+
+    fn recompute_streamlines(&mut self) {
+        self.streamline_generation = self.streamline_generation.wrapping_add(1).max(1);
+        let generation = self.streamline_generation;
+        let Some(active) = &self.vector_field else {
+            self.request_streamlines_for_display();
+            return;
+        };
+        let settings = self.scene.streamlines_for(active.section.as_deref());
+        if !settings.enabled
+            || settings.horizontal_component.as_deref()
+                != Some(active.horizontal_component.as_str())
+            || settings.vertical_component.as_deref() != Some(active.vertical_component.as_str())
+            || self.displayed_path.as_deref() != Some(active.path.as_str())
+        {
+            self.request_streamlines_for_display();
+            return;
+        }
+        let path = active.path.clone();
+        let section = active.section.clone();
+        let horizontal_component = active.horizontal_component.clone();
+        let vertical_component = active.vertical_component.clone();
+        let field = active.field.clone();
+        let sender = self.sender.clone();
+        self.streamline_loading = true;
+        thread::spawn(move || {
+            let lines = field.integrate(&settings);
+            let _ = sender.send(Event::StreamlinesComputed {
+                generation,
+                path,
+                section,
+                horizontal_component,
+                vertical_component,
+                result: Ok((field, lines)),
+            });
+        });
+    }
+
+    fn update_streamline_style(&mut self) {
+        if let Some(overlay) = &mut self.streamline_overlay {
+            overlay.settings = self.scene.streamlines_for(overlay.section.as_deref());
+        }
     }
 
     fn stash_current_scene(&mut self) {
@@ -443,25 +904,138 @@ impl ViewerApp {
         self.editor = AnnotationEditor::default();
     }
 
-    fn adjacent_file(&mut self, offset: isize) {
-        let Some(selected) = self.selected_path.as_deref() else {
-            return;
+    fn timeline_indices(&self) -> Vec<usize> {
+        let Some(path) = self
+            .selected_path
+            .as_deref()
+            .or(self.displayed_path.as_deref())
+        else {
+            return Vec::new();
         };
-        let Some(index) = self.files.iter().position(|file| file.path == selected) else {
-            return;
-        };
-        let current = &self.files[index];
-        let candidates: Vec<&PlotFile> = self
-            .files
+        timeline_indices(&self.files, path)
+    }
+
+    fn timeline_position(&self, timeline: &[usize]) -> Option<usize> {
+        let path = self
+            .selected_path
+            .as_deref()
+            .or(self.displayed_path.as_deref())?;
+        timeline
             .iter()
-            .filter(|file| file.section == current.section && file.var_id == current.var_id)
-            .collect();
-        let Some(position) = candidates.iter().position(|file| file.path == selected) else {
+            .position(|index| self.files[*index].path == path)
+    }
+
+    fn displayed_timeline_position(&self, timeline: &[usize]) -> Option<usize> {
+        let path = self.displayed_path.as_deref()?;
+        timeline
+            .iter()
+            .position(|index| self.files[*index].path == path)
+    }
+
+    fn request_timeline_position(&mut self, position: usize, manual: bool) {
+        let timeline = self.timeline_indices();
+        let Some(file_index) = timeline.get(position).copied() else {
             return;
         };
-        let next = (position as isize + offset).clamp(0, candidates.len() as isize - 1) as usize;
-        if next != position {
-            self.inspect(candidates[next].path.clone());
+        let path = self.files[file_index].path.clone();
+        if manual {
+            self.pause_playback();
+        }
+        self.selected_path = Some(path);
+        if let Some(variable) = self.selected_variable.clone() {
+            self.request_selected_plot(variable);
+        } else if let Some(path) = self.selected_path.clone() {
+            self.inspect(path);
+        }
+    }
+
+    fn frame_duration(&self) -> Duration {
+        Duration::from_secs_f32(1.0 / self.playback_fps.clamp(0.5, 30.0))
+    }
+
+    fn pause_playback(&mut self) {
+        self.playing = false;
+        self.buffering = false;
+        self.next_frame_at = None;
+    }
+
+    fn toggle_playback(&mut self) {
+        if self.playing {
+            self.pause_playback();
+        } else if self.timeline_indices().len() > 1 && self.plot.lock().unwrap().data.is_some() {
+            self.playing = true;
+            self.buffering = false;
+            self.next_frame_at = Some(Instant::now() + self.frame_duration());
+        }
+    }
+
+    fn playback_tick(&mut self) {
+        if !self.playing {
+            return;
+        }
+        if self.loading {
+            self.buffering = true;
+            return;
+        }
+        let now = Instant::now();
+        let frame_duration = self.frame_duration();
+        let deadline = self.next_frame_at.get_or_insert(now + frame_duration);
+        if now < *deadline {
+            return;
+        }
+        let timeline = self.timeline_indices();
+        let Some(position) = self.displayed_timeline_position(&timeline) else {
+            self.pause_playback();
+            return;
+        };
+        let Some(next) = next_playback_position(position, timeline.len(), self.playback_loop)
+        else {
+            self.pause_playback();
+            return;
+        };
+        self.buffering = true;
+        self.next_frame_at = None;
+        self.request_timeline_position(next, false);
+    }
+
+    fn schedule_prefetch(&mut self) {
+        let timeline = self.timeline_indices();
+        if timeline.len() < 2 {
+            return;
+        }
+        let Some(position) = self.displayed_timeline_position(&timeline) else {
+            return;
+        };
+        let Some(variable) = self.displayed_variable.clone() else {
+            return;
+        };
+        let reuse_mesh = self
+            .plot
+            .lock()
+            .unwrap()
+            .data
+            .as_ref()
+            .map(|data| data.mesh.clone());
+        let previous = if position > 0 {
+            Some(position - 1)
+        } else {
+            self.playback_loop.then_some(timeline.len() - 1)
+        };
+        let next = if position + 1 < timeline.len() {
+            Some(position + 1)
+        } else {
+            self.playback_loop.then_some(0)
+        };
+        for neighbor in [previous, next].into_iter().flatten() {
+            let path = self.files[timeline[neighbor]].path.clone();
+            if let Ok(key) = PlotKey::for_file(path, variable.clone(), 0) {
+                self.loader.load(
+                    self.load_epoch,
+                    key,
+                    RequestPriority::Prefetch,
+                    reuse_mesh.clone(),
+                );
+            }
         }
     }
 
@@ -571,12 +1145,20 @@ impl ViewerApp {
         if undo {
             self.editor.undo(&mut self.scene);
             self.sync_plot_appearance();
+            self.recompute_streamlines();
         }
         if redo {
             self.editor.redo(&mut self.scene);
             self.sync_plot_appearance();
+            self.recompute_streamlines();
         }
         if !context.egui_wants_keyboard_input() {
+            if context.input(|input| input.key_pressed(egui::Key::Escape)) {
+                self.placing_streamline_seed = false;
+            }
+            if context.input(|input| input.key_pressed(egui::Key::Space)) {
+                self.toggle_playback();
+            }
             if context.input(|input| {
                 input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
             }) {
@@ -641,38 +1223,6 @@ impl ViewerApp {
                         .clicked()
                     {
                         self.show_export_dialog = true;
-                    }
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.label(RichText::new("TIMESTEP").size(9.5).strong().color(MUTED));
-                    if ui
-                        .button("Prev")
-                        .on_hover_text("Previous timestep")
-                        .clicked()
-                    {
-                        self.adjacent_file(-1);
-                    }
-                    if ui.button("Next").on_hover_text("Next timestep").clicked() {
-                        self.adjacent_file(1);
-                    }
-                    if let Some(file) = self.selected_file() {
-                        egui::Frame::new()
-                            .fill(Color32::from_rgb(20, 30, 42))
-                            .corner_radius(5)
-                            .inner_margin(egui::Margin::symmetric(9, 4))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{}  ·  t={}  ·  n={}",
-                                        file.section.as_deref().unwrap_or("unclassified"),
-                                        file.time_step
-                                            .map_or_else(|| "-".into(), |value| value.to_string()),
-                                        file.dump_index
-                                            .map_or_else(|| "-".into(), |value| value.to_string()),
-                                    ))
-                                    .color(Color32::from_rgb(201, 211, 222)),
-                                );
-                            });
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.loading || self.choosing_run || self.io_busy {
@@ -786,13 +1336,20 @@ impl ViewerApp {
             )
             .show(root, |ui| {
                 ui.horizontal(|ui| {
-                    let width = (ui.available_width() - 3.0 * ui.spacing().item_spacing.x) / 4.0;
+                    let count = InspectorTab::ALL.len() as f32;
+                    let width = (ui.available_width()
+                        - (count - 1.0) * ui.spacing().item_spacing.x)
+                        / count;
                     for tab in InspectorTab::ALL {
                         if ui
                             .add_sized(
                                 [width, 32.0],
-                                egui::Button::selectable(self.inspector_tab == tab, tab.name()),
+                                egui::Button::selectable(
+                                    self.inspector_tab == tab,
+                                    tab.short_name(),
+                                ),
                             )
+                            .on_hover_text(tab.name())
                             .clicked()
                         {
                             self.inspector_tab = tab;
@@ -806,6 +1363,7 @@ impl ViewerApp {
                     InspectorTab::Data => self.data_inspector(ui),
                     InspectorTab::Appearance => self.appearance_inspector(ui),
                     InspectorTab::Annotations => self.annotation_inspector(ui),
+                    InspectorTab::FieldLines => self.streamline_inspector(ui),
                     InspectorTab::Metadata => self.metadata_inspector(ui),
                 });
             });
@@ -887,6 +1445,36 @@ impl ViewerApp {
         ui.small(
             RichText::new("Drag to pan · wheel to zoom · double-click or F to fit").color(MUTED),
         );
+        drop(shared);
+
+        ui.add_space(14.0);
+        section_heading(ui, "Performance");
+        let before = self.cache_limit_mib;
+        ui.horizontal(|ui| {
+            ui.label("Memory cache");
+            ui.add(
+                egui::DragValue::new(&mut self.cache_limit_mib)
+                    .range(64..=8192)
+                    .speed(64)
+                    .suffix(" MiB"),
+            );
+        });
+        if self.cache_limit_mib != before {
+            self.loader
+                .set_limit_bytes(mib_to_bytes(self.cache_limit_mib));
+        }
+        let used_mib = self.cache_stats.used_bytes as f64 / (1024.0 * 1024.0);
+        ui.label(
+            RichText::new(format!(
+                "{used_mib:.1} MiB used · {} cached frames",
+                self.cache_stats.entries
+            ))
+            .small()
+            .color(MUTED),
+        );
+        if ui.button("Clear cache").clicked() {
+            self.loader.clear();
+        }
     }
 
     fn appearance_inspector(&mut self, ui: &mut egui::Ui) {
@@ -1200,9 +1788,430 @@ impl ViewerApp {
         }
     }
 
+    fn streamline_inspector(&mut self, ui: &mut egui::Ui) {
+        let data = self.plot.lock().unwrap().data.clone();
+        let Some(data) = data else {
+            section_heading(ui, "Field lines");
+            ui.label(RichText::new("Load a plot to configure streamlines.").color(MUTED));
+            return;
+        };
+        let section = data.header.section.clone();
+        let before = self.scene.streamlines_for(section.as_deref());
+        let mut edited = before.clone();
+        let variables: Vec<_> = self
+            .displayed_info
+            .as_ref()
+            .or(self.info.as_ref())
+            .map(|info| {
+                info.variables
+                    .iter()
+                    .filter(|variable| {
+                        !is_coordinate(&variable.source) && !is_coordinate(&variable.canonical)
+                    })
+                    .map(|variable| {
+                        (
+                            variable.canonical.clone(),
+                            if variable.canonical == variable.source {
+                                variable.source.clone()
+                            } else {
+                                format!("{} · {}", variable.canonical, variable.source)
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        section_heading(ui, "Optional field-line overlay");
+        ui.label(
+            RichText::new(format!(
+                "Section · {}",
+                section.as_deref().unwrap_or("unclassified")
+            ))
+            .small()
+            .color(MUTED),
+        );
+        let magnetic = self.magnetic_components();
+        if !edited.enabled {
+            ui.add_space(8.0);
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(18, 29, 41))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(42, 65, 84)))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("No field lines are being drawn").strong());
+                    ui.label(
+                        RichText::new(
+                            "Streamtraces are optional. Add an overlay only when you need one.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    let add_magnetic = ui
+                        .add_enabled(
+                            magnetic.is_some(),
+                            egui::Button::new(
+                                RichText::new("Add magnetic field lines").strong(),
+                            )
+                            .fill(Color32::from_rgb(34, 91, 137))
+                            .min_size(egui::vec2(ui.available_width(), 36.0)),
+                        )
+                        .on_hover_text(
+                            "Use the magnetic-field components aligned with the plot axes",
+                        );
+                    if add_magnetic.clicked()
+                        && let Some((horizontal, vertical)) = magnetic.clone()
+                    {
+                        edited.enabled = true;
+                        edited.horizontal_component = Some(horizontal);
+                        edited.vertical_component = Some(vertical);
+                        if edited.seeds.is_empty() {
+                            edited.seeds = seed_grid(
+                                data.header.bounds,
+                                edited.seed_columns,
+                                edited.seed_rows,
+                            );
+                        }
+                    }
+                    if magnetic.is_none() {
+                        ui.label(
+                            RichText::new(
+                                "No magnetic-field pair matches the current plot axes. Use a custom vector field below.",
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
+                    }
+                });
+
+            ui.add_space(14.0);
+            section_heading(ui, "Or add a custom vector field");
+            ui.label(
+                RichText::new("Choose the two components that point along the plot axes.")
+                    .small()
+                    .color(MUTED),
+            );
+            variable_combo(
+                ui,
+                "Horizontal component",
+                &mut edited.horizontal_component,
+                &variables,
+            );
+            variable_combo(
+                ui,
+                "Vertical component",
+                &mut edited.vertical_component,
+                &variables,
+            );
+            let custom_is_valid = edited.horizontal_component.is_some()
+                && edited.vertical_component.is_some()
+                && edited.horizontal_component != edited.vertical_component;
+            if edited.horizontal_component.is_some()
+                && edited.horizontal_component == edited.vertical_component
+            {
+                ui.colored_label(
+                    Color32::from_rgb(241, 126, 126),
+                    "Choose two different vector components.",
+                );
+            }
+            if ui
+                .add_enabled(
+                    custom_is_valid,
+                    egui::Button::new("Add custom field lines")
+                        .min_size(egui::vec2(ui.available_width(), 32.0)),
+                )
+                .clicked()
+            {
+                edited.enabled = true;
+                if edited.seeds.is_empty() {
+                    edited.seeds =
+                        seed_grid(data.header.bounds, edited.seed_columns, edited.seed_rows);
+                }
+            }
+        } else {
+            ui.add_space(8.0);
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(17, 38, 47))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(47, 101, 112)))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Field-line overlay is on")
+                                .strong()
+                                .color(ACCENT),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .button("Hide")
+                                .on_hover_text("Remove field lines from the plot")
+                                .clicked()
+                            {
+                                edited.enabled = false;
+                            }
+                        });
+                    });
+                });
+
+            ui.add_space(10.0);
+            section_heading(ui, "Vector components");
+            if ui
+                .add_enabled(
+                    magnetic.is_some(),
+                    egui::Button::new("Use magnetic-field components"),
+                )
+                .on_hover_text("Choose the magnetic components aligned with the plot axes")
+                .clicked()
+                && let Some((horizontal, vertical)) = magnetic
+            {
+                edited.horizontal_component = Some(horizontal);
+                edited.vertical_component = Some(vertical);
+            }
+            variable_combo(
+                ui,
+                "Horizontal component",
+                &mut edited.horizontal_component,
+                &variables,
+            );
+            variable_combo(
+                ui,
+                "Vertical component",
+                &mut edited.vertical_component,
+                &variables,
+            );
+            if edited.horizontal_component.is_some()
+                && edited.horizontal_component == edited.vertical_component
+            {
+                ui.colored_label(
+                    Color32::from_rgb(241, 126, 126),
+                    "Choose two different vector components.",
+                );
+            }
+
+            ui.add_space(12.0);
+            section_heading(ui, "Seeds");
+            ui.horizontal(|ui| {
+                let can_place = edited.horizontal_component.is_some()
+                    && edited.vertical_component.is_some()
+                    && edited.horizontal_component != edited.vertical_component;
+                if ui
+                    .add_enabled(
+                        can_place,
+                        egui::Button::selectable(self.placing_streamline_seed, "Place on plot"),
+                    )
+                    .on_hover_text("Click the canvas to add streamline seeds")
+                    .clicked()
+                {
+                    self.placing_streamline_seed = !self.placing_streamline_seed;
+                    if self.placing_streamline_seed {
+                        self.editor.cancel_drawing();
+                        self.editor.tool = DrawingTool::Select;
+                    }
+                }
+                if ui
+                    .add_enabled(!edited.seeds.is_empty(), egui::Button::new("Clear"))
+                    .clicked()
+                {
+                    edited.seeds.clear();
+                }
+                ui.label(
+                    RichText::new(format!("{} seeds", edited.seeds.len()))
+                        .small()
+                        .color(MUTED),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label("Grid");
+                ui.add(
+                    egui::DragValue::new(&mut edited.seed_columns)
+                        .range(1..=16)
+                        .prefix("columns "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut edited.seed_rows)
+                        .range(1..=16)
+                        .prefix("rows "),
+                );
+            });
+            if ui.button("Replace with uniform grid").clicked() {
+                edited.seeds = seed_grid(data.header.bounds, edited.seed_columns, edited.seed_rows);
+            }
+            if edited.seeds.is_empty() {
+                ui.label(
+                    RichText::new("Place seeds on the plot or generate a uniform grid.")
+                        .color(MUTED),
+                );
+            } else {
+                let mut remove = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("streamline_seed_list")
+                    .max_height(170.0)
+                    .show(ui, |ui| {
+                        for (index, seed) in edited.seeds.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.small(format!("{}", index + 1));
+                                ui.add(egui::DragValue::new(&mut seed.x).speed(0.01).prefix("x "));
+                                ui.add(egui::DragValue::new(&mut seed.y).speed(0.01).prefix("y "));
+                                if ui.small_button("×").on_hover_text("Remove seed").clicked() {
+                                    remove = Some(index);
+                                }
+                            });
+                        }
+                    });
+                if let Some(index) = remove {
+                    edited.seeds.remove(index);
+                }
+            }
+
+            ui.add_space(12.0);
+            section_heading(ui, "Integration");
+            egui::ComboBox::from_label("Direction")
+                .selected_text(match edited.direction {
+                    StreamlineDirection::Forward => "Forward",
+                    StreamlineDirection::Backward => "Backward",
+                    StreamlineDirection::Both => "Both directions",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut edited.direction,
+                        StreamlineDirection::Both,
+                        "Both directions",
+                    );
+                    ui.selectable_value(
+                        &mut edited.direction,
+                        StreamlineDirection::Forward,
+                        "Forward",
+                    );
+                    ui.selectable_value(
+                        &mut edited.direction,
+                        StreamlineDirection::Backward,
+                        "Backward",
+                    );
+                });
+            let mut step_percent = edited.step_fraction * 100.0;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut step_percent)
+                        .range(0.001..=5.0)
+                        .speed(0.01)
+                        .suffix("% domain / step"),
+                )
+                .changed()
+            {
+                edited.step_fraction = step_percent / 100.0;
+            }
+            ui.add(
+                egui::DragValue::new(&mut edited.max_steps)
+                    .range(10..=5_000)
+                    .speed(50)
+                    .suffix(" max steps"),
+            );
+
+            ui.add_space(12.0);
+            section_heading(ui, "Line style");
+            let mut color = edited.color.to_egui();
+            ui.horizontal(|ui| {
+                ui.label("Color");
+                if ui.color_edit_button_srgba(&mut color).changed() {
+                    edited.color = RgbaColor::from_egui(color);
+                }
+            });
+            ui.add(
+                egui::Slider::new(&mut edited.width, 0.25..=8.0)
+                    .text("Width")
+                    .suffix(" px"),
+            );
+            ui.checkbox(&mut edited.arrows, "Show direction arrows");
+            if edited.arrows {
+                ui.add(
+                    egui::Slider::new(&mut edited.arrow_size, 3.0..=20.0)
+                        .text("Arrow size")
+                        .suffix(" px"),
+                );
+            }
+
+            if self.streamline_loading {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new("Computing field lines…").color(MUTED));
+                });
+            } else if let Some(error) = &self.streamline_error {
+                ui.add_space(8.0);
+                ui.colored_label(Color32::from_rgb(241, 126, 126), error);
+            } else if let Some(overlay) = &self.streamline_overlay {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} field lines · {} / {}",
+                        overlay.lines.len(),
+                        overlay.horizontal_component,
+                        overlay.vertical_component
+                    ))
+                    .small()
+                    .color(MUTED),
+                );
+            }
+        }
+
+        if edited != before {
+            let reload = edited.enabled != before.enabled
+                || edited.horizontal_component != before.horizontal_component
+                || edited.vertical_component != before.vertical_component;
+            let reintegrate = edited.seeds != before.seeds
+                || edited.step_fraction != before.step_fraction
+                || edited.max_steps != before.max_steps
+                || edited.direction != before.direction;
+            self.editor.checkpoint(&self.scene);
+            self.scene
+                .set_streamlines_for(section.as_deref(), edited.clone());
+            if !edited.enabled
+                || edited.horizontal_component.is_none()
+                || edited.vertical_component.is_none()
+                || edited.horizontal_component == edited.vertical_component
+            {
+                self.placing_streamline_seed = false;
+            }
+            if reload {
+                self.request_streamlines_for_display();
+            } else if reintegrate {
+                self.recompute_streamlines();
+            } else {
+                self.update_streamline_style();
+            }
+        }
+    }
+
+    fn magnetic_components(&self) -> Option<(String, String)> {
+        let data = self.plot.lock().unwrap().data.clone()?;
+        let horizontal_axis = coordinate_axis(&data.header.x_label)?;
+        let vertical_axis = coordinate_axis(&data.header.y_label)?;
+        let info = self.displayed_info.as_ref().or(self.info.as_ref())?;
+        let component = |axis: char| {
+            let canonical = format!("magnetic_field.{axis}");
+            info.variables
+                .iter()
+                .find(|variable| variable.canonical.eq_ignore_ascii_case(&canonical))
+                .map(|variable| variable.canonical.clone())
+                .or_else(|| {
+                    info.variables
+                        .iter()
+                        .find(|variable| {
+                            let source = variable.source.to_ascii_lowercase().replace(' ', "");
+                            source.starts_with(&format!("b_{axis}"))
+                                || source.starts_with(&format!("b{axis}["))
+                        })
+                        .map(|variable| variable.canonical.clone())
+                })
+        };
+        Some((component(horizontal_axis)?, component(vertical_axis)?))
+    }
+
     fn metadata_inspector(&mut self, ui: &mut egui::Ui) {
         section_heading(ui, "Dataset");
-        if let Some(info) = &self.info {
+        if let Some(info) = &self.displayed_info {
             ui.label(RichText::new(&info.title).strong());
             ui.small(&info.path);
             if let Some(section) = &info.section {
@@ -1233,6 +2242,19 @@ impl ViewerApp {
     }
 
     fn plot_panel(&mut self, root: &mut egui::Ui) {
+        let can_place_streamline_seed = self
+            .plot
+            .lock()
+            .unwrap()
+            .data
+            .as_ref()
+            .map(|data| self.scene.streamlines_for(data.header.section.as_deref()))
+            .is_some_and(|settings| {
+                settings.enabled
+                    && settings.horizontal_component.is_some()
+                    && settings.vertical_component.is_some()
+                    && settings.horizontal_component != settings.vertical_component
+            });
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(DEEP_BG))
             .show(root, |ui| {
@@ -1267,7 +2289,21 @@ impl ViewerApp {
                                 ) {
                                     self.editor.cancel_drawing();
                                     self.editor.tool = tool;
+                                    self.placing_streamline_seed = false;
                                 }
+                            }
+                            ui.separator();
+                            if toolbar_icon_button(
+                                ui,
+                                ToolbarIcon::StreamlineSeed,
+                                self.placing_streamline_seed,
+                                can_place_streamline_seed,
+                                "Place field-line seeds on the plot",
+                            ) {
+                                self.editor.cancel_drawing();
+                                self.editor.tool = DrawingTool::Select;
+                                self.placing_streamline_seed = !self.placing_streamline_seed;
+                                self.inspector_tab = InspectorTab::FieldLines;
                             }
                             ui.separator();
                             if toolbar_icon_button(
@@ -1288,6 +2324,7 @@ impl ViewerApp {
                             ) {
                                 self.editor.undo(&mut self.scene);
                                 self.sync_plot_appearance();
+                                self.recompute_streamlines();
                             }
                             if toolbar_icon_button(
                                 ui,
@@ -1298,6 +2335,7 @@ impl ViewerApp {
                             ) {
                                 self.editor.redo(&mut self.scene);
                                 self.sync_plot_appearance();
+                                self.recompute_streamlines();
                             }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -1314,7 +2352,8 @@ impl ViewerApp {
                 ui.add_space(7.0);
 
                 let available = ui.available_size();
-                let (export_rect, _) = ui.allocate_exact_size(available, Sense::hover());
+                let plot_size = egui::vec2(available.x, (available.y - 57.0).max(120.0));
+                let (export_rect, _) = ui.allocate_exact_size(plot_size, Sense::hover());
                 self.last_export_rect = Some(export_rect);
                 let export_background = ExportBackground::Dark;
                 let canvas = export_background.canvas_color();
@@ -1326,7 +2365,138 @@ impl ViewerApp {
                     let shared = self.plot.lock().unwrap();
                     (shared.data.clone(), shared.display.clone())
                 };
-                let Some(data) = data else {
+                if let Some(data) = data {
+                    let chart_outer = egui::Rect::from_min_max(
+                        export_rect.min + egui::vec2(64.0, 62.0),
+                        export_rect.max - egui::vec2(112.0, 52.0),
+                    );
+                    let plot_rect = fit_plot_rect(chart_outer, display.view_bounds);
+                    let response = ui.interact(
+                        plot_rect,
+                        ui.id().with("plot_interaction"),
+                        Sense::click_and_drag(),
+                    );
+                    ui.painter().rect_filled(plot_rect, 2.0, canvas);
+                    ui.painter().rect_stroke(
+                        plot_rect,
+                        2.0,
+                        Stroke::new(1.0, muted.gamma_multiply(0.55)),
+                        StrokeKind::Inside,
+                    );
+                    ui.painter()
+                        .add(PlotCallback::paint_callback(plot_rect, self.plot.clone()));
+                    if let Some(overlay) = self.streamline_overlay.as_ref().filter(|overlay| {
+                        self.displayed_path.as_deref() == Some(overlay.path.as_str())
+                    }) {
+                        paint_streamlines(
+                            ui,
+                            plot_rect,
+                            display.view_bounds,
+                            overlay,
+                            self.placing_streamline_seed
+                                || self.inspector_tab == InspectorTab::FieldLines,
+                        );
+                    }
+
+                    let (section, variable, relative_path) = self.scope_values();
+                    let scope = ScopeContext {
+                        section: section.as_deref(),
+                        variable: variable.as_deref(),
+                        relative_path: relative_path.as_deref(),
+                    };
+                    let (pointer_clicked, pointer_released, raw_release, latest_pointer) =
+                        ui.input(|input| {
+                        let raw_release = input.events.iter().rev().find_map(|event| match event {
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed: false,
+                                ..
+                            } => Some(*pos),
+                            _ => None,
+                        });
+                        (
+                            input.pointer.primary_clicked(),
+                            input.pointer.primary_released(),
+                            raw_release,
+                            input.pointer.latest_pos(),
+                        )
+                    });
+                    let seed_click = response.clicked_by(egui::PointerButton::Primary)
+                        || response.drag_stopped_by(egui::PointerButton::Primary)
+                        || pointer_clicked
+                        || pointer_released
+                        || raw_release.is_some();
+                    let new_seed = (self.placing_streamline_seed && seed_click)
+                        .then(|| {
+                            response
+                                .interact_pointer_pos()
+                                .or(raw_release)
+                                .or(latest_pointer)
+                        })
+                        .flatten()
+                        .filter(|pointer| plot_rect.contains(*pointer))
+                        .map(|pointer| {
+                            streamline_seed_point(pointer, plot_rect, display.view_bounds)
+                        });
+                    let consumed = if self.placing_streamline_seed {
+                        new_seed.is_some()
+                    } else {
+                        self.editor.interact(
+                            ui,
+                            &response,
+                            plot_rect,
+                            display.view_bounds,
+                            &mut self.scene,
+                            &scope,
+                        )
+                    };
+                    if let Some(seed) = new_seed {
+                        self.editor.checkpoint(&self.scene);
+                        let mut settings = self.scene.streamlines_for(section.as_deref());
+                        settings.seeds.push(seed);
+                        self.scene
+                            .set_streamlines_for(section.as_deref(), settings);
+                        self.recompute_streamlines();
+                    }
+                    if self.editor.tool == DrawingTool::Select && !consumed {
+                        let mut shared = self.plot.lock().unwrap();
+                        if response.dragged() {
+                            let delta = ui.input(|input| input.pointer.delta());
+                            shared
+                                .pan_view(-delta.x / plot_rect.width(), delta.y / plot_rect.height());
+                        }
+                        if response.double_clicked() && !self.placing_streamline_seed {
+                            shared.reset_view();
+                        }
+                    }
+                    if response.hovered() {
+                        let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+                        if scroll != 0.0 {
+                            self.plot.lock().unwrap().zoom_view((-scroll * 0.002).exp());
+                        }
+                    }
+                    self.editor.paint(
+                        ui,
+                        plot_rect,
+                        display.view_bounds,
+                        &self.scene,
+                        &scope,
+                        true,
+                    );
+                    let appearance = self
+                        .scene
+                        .appearance_for(self.displayed_variable.as_deref());
+                    paint_plot_chrome(
+                        ui,
+                        export_rect,
+                        plot_rect,
+                        &self.plot_chrome(&data.header),
+                        &display,
+                        &appearance,
+                        PlotColors { foreground, muted },
+                    );
+                } else {
                     ui.painter().text(
                         export_rect.center(),
                         egui::Align2::CENTER_CENTER,
@@ -1334,77 +2504,125 @@ impl ViewerApp {
                         FontId::proportional(18.0),
                         muted,
                     );
-                    return;
-                };
-
-                let chart_outer = egui::Rect::from_min_max(
-                    export_rect.min + egui::vec2(64.0, 62.0),
-                    export_rect.max - egui::vec2(112.0, 52.0),
-                );
-                let plot_rect = fit_plot_rect(chart_outer, display.view_bounds);
-                let response = ui.interact(
-                    plot_rect,
-                    ui.id().with("plot_interaction"),
-                    Sense::click_and_drag(),
-                );
-                ui.painter().rect_filled(plot_rect, 2.0, canvas);
-                ui.painter().rect_stroke(
-                    plot_rect,
-                    2.0,
-                    Stroke::new(1.0, muted.gamma_multiply(0.55)),
-                    StrokeKind::Inside,
-                );
-                ui.painter().add(PlotCallback::paint_callback(plot_rect, self.plot.clone()));
-
-                let (section, variable, relative_path) = self.scope_values();
-                let scope = ScopeContext {
-                    section: section.as_deref(),
-                    variable: variable.as_deref(),
-                    relative_path: relative_path.as_deref(),
-                };
-                let consumed = self.editor.interact(
-                    ui,
-                    &response,
-                    plot_rect,
-                    display.view_bounds,
-                    &mut self.scene,
-                    &scope,
-                );
-                if self.editor.tool == DrawingTool::Select && !consumed {
-                    let mut shared = self.plot.lock().unwrap();
-                    if response.dragged() {
-                        let delta = ui.input(|input| input.pointer.delta());
-                        shared.pan_view(-delta.x / plot_rect.width(), delta.y / plot_rect.height());
-                    }
-                    if response.double_clicked() {
-                        shared.reset_view();
-                    }
                 }
-                if response.hovered() {
-                    let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-                    if scroll != 0.0 {
-                        self.plot.lock().unwrap().zoom_view((-scroll * 0.002).exp());
-                    }
-                }
-                self.editor.paint(
-                    ui,
-                    plot_rect,
-                    display.view_bounds,
-                    &self.scene,
-                    &scope,
-                    true,
-                );
-                let appearance = self.scene.appearance_for(self.selected_variable.as_deref());
-                paint_plot_chrome(
-                    ui,
-                    export_rect,
-                    plot_rect,
-                    &self.plot_chrome(&data.header),
-                    &display,
-                    &appearance,
-                    PlotColors { foreground, muted },
-                );
+                ui.add_space(7.0);
+                self.timeline_bar(ui);
             });
+    }
+
+    fn timeline_bar(&mut self, ui: &mut egui::Ui) {
+        let timeline = self.timeline_indices();
+        let position = self.timeline_position(&timeline).unwrap_or(0);
+        let mut slider_position = self.scrub_target.unwrap_or(position);
+        let previous_fps = self.playback_fps;
+        let previous_loop = self.playback_loop;
+        let mut requested_position = None;
+        let mut toggle_playback = false;
+        let mut scrub_stopped = false;
+        egui::Frame::new()
+            .fill(PANEL_BG)
+            .corner_radius(6)
+            .stroke(Stroke::new(1.0, Color32::from_rgb(31, 43, 57)))
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let has_previous = !timeline.is_empty() && slider_position > 0;
+                    if toolbar_icon_button(
+                        ui,
+                        ToolbarIcon::Previous,
+                        false,
+                        has_previous,
+                        "Previous frame",
+                    ) {
+                        requested_position = slider_position.checked_sub(1);
+                    }
+                    if toolbar_icon_button(
+                        ui,
+                        if self.playing {
+                            ToolbarIcon::Pause
+                        } else {
+                            ToolbarIcon::Play
+                        },
+                        self.playing,
+                        timeline.len() > 1 && self.plot.lock().unwrap().data.is_some(),
+                        if self.playing { "Pause" } else { "Play" },
+                    ) {
+                        toggle_playback = true;
+                    }
+                    let has_next = slider_position + 1 < timeline.len();
+                    if toolbar_icon_button(ui, ToolbarIcon::Next, false, has_next, "Next frame") {
+                        requested_position = Some(slider_position + 1);
+                    }
+                    ui.add_space(4.0);
+                    let slider_width = (ui.available_width() - 330.0).max(100.0);
+                    let slider = ui.add_sized(
+                        [slider_width, 24.0],
+                        egui::Slider::new(
+                            &mut slider_position,
+                            0..=timeline.len().saturating_sub(1),
+                        )
+                        .show_value(false),
+                    );
+                    if slider.changed() {
+                        self.pause_playback();
+                        self.scrub_target = Some(slider_position);
+                        self.scrub_changed_at = Some(Instant::now());
+                    }
+                    scrub_stopped = slider.drag_stopped();
+                    ui.label(format!(
+                        "{} / {}",
+                        slider_position.saturating_add(1).min(timeline.len()),
+                        timeline.len()
+                    ));
+                    if let Some(index) = timeline.get(slider_position) {
+                        let file = &self.files[*index];
+                        ui.label(
+                            RichText::new(format!(
+                                "t={}  n={}",
+                                file.time_step.map_or_else(|| "-".into(), |v| v.to_string()),
+                                file.dump_index
+                                    .map_or_else(|| "-".into(), |v| v.to_string())
+                            ))
+                            .color(MUTED),
+                        );
+                    }
+                    ui.add(
+                        egui::DragValue::new(&mut self.playback_fps)
+                            .range(0.5..=30.0)
+                            .speed(0.5)
+                            .fixed_decimals(1)
+                            .suffix(" FPS"),
+                    );
+                    ui.checkbox(&mut self.playback_loop, "Loop");
+                    if self.buffering {
+                        ui.spinner();
+                        ui.label(RichText::new("Buffering").small().color(MUTED));
+                    }
+                });
+            });
+        if self.playing && self.playback_fps != previous_fps {
+            self.next_frame_at = Some(Instant::now() + self.frame_duration());
+        }
+        if self.playback_loop != previous_loop {
+            self.schedule_prefetch();
+        }
+        if toggle_playback {
+            self.toggle_playback();
+        }
+        if let Some(position) = requested_position {
+            self.scrub_target = None;
+            self.scrub_changed_at = None;
+            self.request_timeline_position(position, true);
+        } else if (scrub_stopped
+            || self
+                .scrub_changed_at
+                .is_some_and(|changed| changed.elapsed() >= Duration::from_millis(75)))
+            && self.scrub_target.is_some()
+        {
+            let position = self.scrub_target.take().expect("scrub target checked");
+            self.scrub_changed_at = None;
+            self.request_timeline_position(position, true);
+        }
     }
 
     fn preview_title(&self, config: &TitleConfig) -> Result<String, String> {
@@ -1417,7 +2635,9 @@ impl ViewerApp {
     }
 
     fn plot_chrome(&self, header: &crate::protocol::PlotHeader) -> PlotChrome {
-        let appearance = self.scene.appearance_for(self.selected_variable.as_deref());
+        let appearance = self
+            .scene
+            .appearance_for(self.displayed_variable.as_deref());
         let title = self
             .title_with_header(&appearance.title, header)
             .unwrap_or_else(|_| header.variable.clone());
@@ -1469,7 +2689,9 @@ impl ViewerApp {
             .as_ref()
             .map(|data| data.header.clone())?;
         let (scope_section, scope_variable, scope_relative_path) = self.scope_values();
-        let appearance = self.scene.appearance_for(self.selected_variable.as_deref());
+        let appearance = self
+            .scene
+            .appearance_for(self.displayed_variable.as_deref());
         Some(ExportFrame {
             render_state,
             plot: self.plot.clone(),
@@ -1478,6 +2700,7 @@ impl ViewerApp {
             scope_variable,
             scope_relative_path,
             appearance,
+            streamlines: self.streamline_overlay.clone(),
             chrome: self.plot_chrome(&header),
             logical_size,
             pixels_per_point,
@@ -1520,14 +2743,14 @@ impl ViewerApp {
     }
 
     fn selected_file(&self) -> Option<&PlotFile> {
-        let path = self.selected_path.as_deref()?;
+        let path = self.displayed_path.as_deref()?;
         self.files.iter().find(|file| file.path == path)
     }
 
     fn scope_values(&self) -> (Option<String>, Option<String>, Option<String>) {
         let section = self.selected_file().and_then(|file| file.section.clone());
-        let variable = self.selected_variable.clone();
-        let relative = self.selected_path.as_ref().map(|path| {
+        let variable = self.displayed_variable.clone();
+        let relative = self.displayed_path.as_ref().map(|path| {
             let path = Path::new(path);
             self.directory
                 .as_ref()
@@ -1593,6 +2816,7 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = root.ctx().clone();
         self.poll_events(&context);
+        self.playback_tick();
         self.shortcuts(&context);
         let dropped: Vec<PathBuf> = context.input(|input| {
             input
@@ -1636,7 +2860,13 @@ impl eframe::App for ViewerApp {
             });
         self.plot_panel(root);
         self.export_options_window(&context);
-        if self.loading || self.choosing_run || self.io_busy {
+        if self.loading
+            || self.choosing_run
+            || self.io_busy
+            || self.streamline_loading
+            || self.playing
+            || self.scrub_target.is_some()
+        {
             context.request_repaint_after(Duration::from_millis(40));
         }
     }
@@ -1646,6 +2876,9 @@ impl eframe::App for ViewerApp {
         let state = PersistedAppState {
             recursive: self.recursive,
             recent_runs: self.stored_runs.clone(),
+            cache_limit_mib: self.cache_limit_mib,
+            playback_fps: self.playback_fps,
+            playback_loop: self.playback_loop,
         };
         eframe::set_value(storage, APP_STORAGE_KEY, &state);
     }
@@ -1826,6 +3059,80 @@ fn paint_toolbar_icon(
                 stroke,
             );
         }
+        ToolbarIcon::StreamlineSeed => {
+            let points: Vec<_> = (0..12)
+                .map(|index| {
+                    let t = index as f32 / 11.0;
+                    egui::pos2(
+                        left + t * rect.width(),
+                        center.y + (t * std::f32::consts::TAU).sin() * rect.height() * 0.22,
+                    )
+                })
+                .collect();
+            painter.add(egui::Shape::line(points, stroke));
+            let plus = egui::pos2(right - 2.5, top + 2.5);
+            painter.line_segment(
+                [plus - egui::vec2(3.0, 0.0), plus + egui::vec2(3.0, 0.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [plus - egui::vec2(0.0, 3.0), plus + egui::vec2(0.0, 3.0)],
+                stroke,
+            );
+        }
+        ToolbarIcon::Previous | ToolbarIcon::Next => {
+            let next = matches!(icon, ToolbarIcon::Next);
+            let direction = if next { 1.0 } else { -1.0 };
+            let bar_x = if next { right - 1.5 } else { left + 1.5 };
+            painter.line_segment(
+                [
+                    egui::pos2(bar_x, top + 1.0),
+                    egui::pos2(bar_x, bottom - 1.0),
+                ],
+                stroke,
+            );
+            let tip_x = if next { right - 4.0 } else { left + 4.0 };
+            let base_x = tip_x - direction * (rect.width() - 7.0);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(tip_x, center.y),
+                    egui::pos2(base_x, top + 2.0),
+                    egui::pos2(base_x, bottom - 2.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        ToolbarIcon::Play => {
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(left + 3.0, top + 1.0),
+                    egui::pos2(right - 1.0, center.y),
+                    egui::pos2(left + 3.0, bottom - 1.0),
+                ],
+                color,
+                Stroke::NONE,
+            ));
+        }
+        ToolbarIcon::Pause => {
+            let width = 4.0;
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(left + 3.0, top + 1.0),
+                    egui::pos2(left + 3.0 + width, bottom - 1.0),
+                ),
+                0.5,
+                color,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(right - 3.0 - width, top + 1.0),
+                    egui::pos2(right - 3.0, bottom - 1.0),
+                ),
+                0.5,
+                color,
+            );
+        }
         ToolbarIcon::FitView => {
             let length = 5.0;
             for (corner, x_direction, y_direction) in [
@@ -1884,6 +3191,59 @@ fn metadata_row(ui: &mut egui::Ui, label: &str, value: &str) {
             ui.label(value);
         });
     });
+}
+
+fn variable_combo(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: &mut Option<String>,
+    variables: &[(String, String)],
+) {
+    egui::ComboBox::from_label(label)
+        .selected_text(selected.as_deref().unwrap_or("Choose a variable"))
+        .width(ui.available_width().min(250.0))
+        .show_ui(ui, |ui| {
+            for (canonical, display) in variables {
+                ui.selectable_value(selected, Some(canonical.clone()), display);
+            }
+        });
+}
+
+fn coordinate_axis(label: &str) -> Option<char> {
+    label
+        .trim_start()
+        .chars()
+        .next()
+        .map(|axis| axis.to_ascii_lowercase())
+        .filter(|axis| matches!(axis, 'x' | 'y' | 'z'))
+}
+
+fn seed_grid(bounds: [f32; 4], columns: u8, rows: u8) -> Vec<DataPoint> {
+    let columns = usize::from(columns.clamp(1, 16));
+    let rows = usize::from(rows.clamp(1, 16));
+    let x_margin = (bounds[1] - bounds[0]) * 0.06;
+    let y_margin = (bounds[3] - bounds[2]) * 0.06;
+    let x_min = bounds[0] + x_margin;
+    let x_max = bounds[1] - x_margin;
+    let y_min = bounds[2] + y_margin;
+    let y_max = bounds[3] - y_margin;
+    let coordinate = |index: usize, count: usize, minimum: f32, maximum: f32| {
+        if count == 1 {
+            0.5 * (minimum + maximum)
+        } else {
+            minimum + (maximum - minimum) * index as f32 / (count - 1) as f32
+        }
+    };
+    (0..rows)
+        .flat_map(|row| {
+            (0..columns).map(move |column| {
+                DataPoint::new(
+                    f64::from(coordinate(column, columns, x_min, x_max)),
+                    f64::from(coordinate(row, rows, y_min, y_max)),
+                )
+            })
+        })
+        .collect()
 }
 
 fn axis_limit_row(
@@ -2190,13 +3550,6 @@ fn is_plt_file(path: &Path) -> bool {
         .is_some_and(|value| value.eq_ignore_ascii_case("plt"))
 }
 
-fn exchange_path(path: &str, variable: &str) -> PathBuf {
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    variable.hash(&mut hasher);
-    std::env::temp_dir().join(format!("batsview-{:016x}.bpv", hasher.finish()))
-}
-
 fn run_key(directory: &str) -> String {
     #[cfg(target_os = "windows")]
     {
@@ -2226,6 +3579,16 @@ fn safe_filename(value: &str) -> String {
     }
 }
 
+fn next_playback_position(position: usize, frame_count: usize, looping: bool) -> Option<usize> {
+    if position + 1 < frame_count {
+        Some(position + 1)
+    } else if looping && frame_count > 1 {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 fn is_coordinate(name: &str) -> bool {
     let compact = name.to_lowercase().replace(' ', "");
     matches!(compact.as_str(), "x" | "y" | "z")
@@ -2251,5 +3614,29 @@ mod tests {
     fn export_filenames_are_portable() {
         assert_eq!(safe_filename("rho [amu/cm3]"), "rho__amu_cm3_");
         assert_eq!(safe_filename(""), "plot");
+    }
+
+    #[test]
+    fn playback_advances_in_order_and_only_wraps_when_looping() {
+        assert_eq!(next_playback_position(0, 3, false), Some(1));
+        assert_eq!(next_playback_position(2, 3, false), None);
+        assert_eq!(next_playback_position(2, 3, true), Some(0));
+        assert_eq!(next_playback_position(0, 1, true), None);
+    }
+
+    #[test]
+    fn plot_axis_labels_map_to_magnetic_component_axes() {
+        assert_eq!(coordinate_axis("X [R]"), Some('x'));
+        assert_eq!(coordinate_axis(" y [R]"), Some('y'));
+        assert_eq!(coordinate_axis("Z"), Some('z'));
+        assert_eq!(coordinate_axis("Longitude"), None);
+    }
+
+    #[test]
+    fn seed_grid_stays_inside_bounds_and_has_requested_size() {
+        let seeds = seed_grid([-10.0, 10.0, -5.0, 5.0], 4, 3);
+        assert_eq!(seeds.len(), 12);
+        assert!(seeds.iter().all(|seed| seed.x > -10.0 && seed.x < 10.0));
+        assert!(seeds.iter().all(|seed| seed.y > -5.0 && seed.y < 5.0));
     }
 }

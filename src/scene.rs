@@ -242,6 +242,93 @@ impl DataPoint {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamlineDirection {
+    Forward,
+    Backward,
+    #[default]
+    Both,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StreamlineSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizontal_component: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vertical_component: Option<String>,
+    #[serde(default)]
+    pub seeds: Vec<DataPoint>,
+    #[serde(default = "default_streamline_step")]
+    pub step_fraction: f32,
+    #[serde(default = "default_streamline_steps")]
+    pub max_steps: u32,
+    #[serde(default)]
+    pub direction: StreamlineDirection,
+    #[serde(default = "default_streamline_color")]
+    pub color: RgbaColor,
+    #[serde(default = "default_streamline_width")]
+    pub width: f32,
+    #[serde(default = "default_true")]
+    pub arrows: bool,
+    #[serde(default = "default_streamline_arrow_size")]
+    pub arrow_size: f32,
+    #[serde(default = "default_seed_columns")]
+    pub seed_columns: u8,
+    #[serde(default = "default_seed_rows")]
+    pub seed_rows: u8,
+}
+
+fn default_streamline_step() -> f32 {
+    0.003
+}
+
+const fn default_streamline_steps() -> u32 {
+    1_200
+}
+
+fn default_streamline_color() -> RgbaColor {
+    RgbaColor([238, 244, 252, 230])
+}
+
+fn default_streamline_width() -> f32 {
+    1.5
+}
+
+fn default_streamline_arrow_size() -> f32 {
+    7.0
+}
+
+const fn default_seed_columns() -> u8 {
+    8
+}
+
+const fn default_seed_rows() -> u8 {
+    6
+}
+
+impl Default for StreamlineSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            horizontal_component: None,
+            vertical_component: None,
+            seeds: Vec::new(),
+            step_fraction: default_streamline_step(),
+            max_steps: default_streamline_steps(),
+            direction: StreamlineDirection::Both,
+            color: default_streamline_color(),
+            width: default_streamline_width(),
+            arrows: true,
+            arrow_size: default_streamline_arrow_size(),
+            seed_columns: default_seed_columns(),
+            seed_rows: default_seed_rows(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AnnotationGeometry {
@@ -472,6 +559,8 @@ pub struct SceneDocument {
     pub variable_overrides: BTreeMap<String, AppearanceSettings>,
     #[serde(default)]
     pub annotations: Vec<Annotation>,
+    #[serde(default)]
+    pub streamlines: BTreeMap<String, StreamlineSettings>,
     #[serde(default = "first_annotation_id")]
     pub next_annotation_id: u64,
 }
@@ -488,6 +577,7 @@ impl Default for SceneDocument {
             run_defaults: AppearanceSettings::default(),
             variable_overrides: BTreeMap::new(),
             annotations: Vec::new(),
+            streamlines: BTreeMap::new(),
             next_annotation_id: first_annotation_id(),
         }
     }
@@ -510,6 +600,22 @@ impl SceneDocument {
             .and_then(|name| self.variable_overrides.get(name))
             .cloned()
             .unwrap_or_else(|| self.run_defaults.clone())
+    }
+
+    pub fn streamlines_for(&self, section: Option<&str>) -> StreamlineSettings {
+        self.streamlines
+            .get(section.unwrap_or_default())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_streamlines_for(&mut self, section: Option<&str>, settings: StreamlineSettings) {
+        let key = section.unwrap_or_default().to_owned();
+        if settings == StreamlineSettings::default() {
+            self.streamlines.remove(&key);
+        } else {
+            self.streamlines.insert(key, settings);
+        }
     }
 
     pub fn set_variable_override(&mut self, variable: &str, enabled: bool) {
@@ -1015,6 +1121,16 @@ mod tests {
     fn scene_round_trip_preserves_annotations_and_overrides() {
         let mut scene = SceneDocument::default();
         scene.set_variable_override("density", true);
+        scene.set_streamlines_for(
+            Some("z=0"),
+            StreamlineSettings {
+                enabled: true,
+                horizontal_component: Some("magnetic_field.x".into()),
+                vertical_component: Some("magnetic_field.y".into()),
+                seeds: vec![DataPoint::new(1.0, 2.0)],
+                ..StreamlineSettings::default()
+            },
+        );
         scene.add_annotation(
             AnnotationGeometry::Line {
                 start: DataPoint::new(0.0, 1.0),
@@ -1029,6 +1145,16 @@ mod tests {
         let decoded: SceneDocument = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, scene);
         assert!(decoded.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_scene_defaults_to_no_field_lines() {
+        let decoded: SceneDocument = serde_json::from_str(
+            r#"{"version":1,"run_defaults":{},"variable_overrides":{},"annotations":[],"next_annotation_id":1}"#,
+        )
+        .unwrap();
+        assert!(decoded.streamlines.is_empty());
+        assert!(!decoded.streamlines_for(Some("z=0")).enabled);
     }
 
     #[test]
