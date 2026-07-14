@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail, ensure};
-use eframe::egui::{self, Color32, Stroke};
+use eframe::egui::{self, Stroke};
 
 use crate::{
     protocol::PlotData,
@@ -295,7 +295,6 @@ pub fn paint_streamlines(
     plot_rect: egui::Rect,
     bounds: [f32; 4],
     overlay: &StreamlineOverlay,
-    show_seeds: bool,
 ) {
     let painter = ui.painter().with_clip_rect(plot_rect);
     let color = overlay.settings.color.to_egui();
@@ -311,13 +310,6 @@ pub fn paint_streamlines(
         painter.add(egui::Shape::line(points.clone(), stroke));
         if overlay.settings.arrows {
             paint_arrow(&painter, &points, stroke, overlay.settings.arrow_size);
-        }
-    }
-    if show_seeds {
-        for seed in &overlay.settings.seeds {
-            let point = data_to_screen(*seed, plot_rect, bounds);
-            painter.circle_filled(point, 3.2, Color32::from_rgb(70, 160, 235));
-            painter.circle_stroke(point, 4.2, Stroke::new(1.0, Color32::WHITE));
         }
     }
 }

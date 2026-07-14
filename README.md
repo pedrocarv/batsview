@@ -100,7 +100,8 @@ Field lines are optional and are never added to a new plot automatically.
 - To visualize another vector field, select its horizontal and vertical
   components and choose **Add custom field lines**.
 - Generate a uniform seed grid or activate **Place on plot** and click the
-  canvas to add individual seeds.
+  canvas to add individual seeds. Seed locations remain available in the
+  inspector but are not drawn over the scientific figure.
 - Configure integration direction, step size, maximum steps, line color and
   width, and direction arrows.
 - Select **Hide** to remove the overlay while preserving its configuration.
@@ -122,7 +123,9 @@ frames per second, and enable looping.
 
 Playback visits frames in order. If the next frame is not ready, the current
 frame remains visible and BATSView displays **Buffering** rather than skipping
-ahead. Neighboring frames are prefetched in the background.
+ahead. Neighboring frames are prefetched in the background. When field lines
+are enabled, the previous completed overlay remains visible until the next one
+is ready, then the two are exchanged without an empty intermediate frame.
 
 ## Scenes and image export
 

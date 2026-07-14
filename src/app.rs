@@ -519,7 +519,6 @@ impl ViewerApp {
                     {
                         continue;
                     }
-                    self.streamline_loading = false;
                     match result {
                         Ok((field, lines)) => {
                             self.vector_field = Some(ActiveVectorField {
@@ -544,6 +543,8 @@ impl ViewerApp {
                             self.streamline_error = Some(error.to_string());
                         }
                     }
+                    self.streamline_loading = false;
+                    self.schedule_next_playback_frame();
                 }
                 _ => {}
             }
@@ -632,15 +633,13 @@ impl ViewerApp {
                             self.plot.lock().unwrap().set_data(data);
                             self.sync_plot_appearance();
                             self.loading = false;
-                            self.buffering = false;
-                            self.next_frame_at =
-                                self.playing.then(|| Instant::now() + self.frame_duration());
                             self.status = if from_cache {
                                 format!("{points} points · {triangles} triangles · cached")
                             } else {
                                 format!("{points} points · {triangles} triangles")
                             };
                             self.request_streamlines_for_display();
+                            self.schedule_next_playback_frame();
                             self.schedule_prefetch();
                         }
                         Err(error) => {
@@ -682,7 +681,6 @@ impl ViewerApp {
         self.loader.cancel_auxiliary();
         self.pending_streamlines = None;
         self.vector_field = None;
-        self.streamline_overlay = None;
         self.streamline_loading = false;
         self.streamline_error = None;
 
@@ -694,6 +692,7 @@ impl ViewerApp {
         let section = data.header.section.clone();
         let settings = self.scene.streamlines_for(section.as_deref());
         if !settings.enabled {
+            self.streamline_overlay = None;
             self.placing_streamline_seed = false;
             return;
         }
@@ -701,16 +700,34 @@ impl ViewerApp {
             settings.horizontal_component.clone(),
             settings.vertical_component.clone(),
         ) else {
+            self.streamline_overlay = None;
             self.streamline_error = Some("Choose both vector components".to_owned());
             return;
         };
         if horizontal_component == vertical_component {
+            self.streamline_overlay = None;
             self.streamline_error = Some("Vector components must be different".to_owned());
             return;
+        }
+        let overlay_is_compatible = self.streamline_overlay.as_ref().is_some_and(|overlay| {
+            streamline_overlay_matches(
+                overlay,
+                section.as_deref(),
+                &horizontal_component,
+                &vertical_component,
+            )
+        });
+        if overlay_is_compatible {
+            if let Some(overlay) = &mut self.streamline_overlay {
+                overlay.settings = settings.clone();
+            }
+        } else {
+            self.streamline_overlay = None;
         }
         let horizontal_key = match PlotKey::for_file(&path, horizontal_component.clone(), 0) {
             Ok(key) => key,
             Err(error) => {
+                self.streamline_overlay = None;
                 self.streamline_error = Some(error);
                 return;
             }
@@ -718,6 +735,7 @@ impl ViewerApp {
         let vertical_key = match PlotKey::for_file(&path, vertical_component.clone(), 0) {
             Ok(key) => key,
             Err(error) => {
+                self.streamline_overlay = None;
                 self.streamline_error = Some(error);
                 return;
             }
@@ -788,7 +806,9 @@ impl ViewerApp {
         if let Some(error) = failed {
             self.pending_streamlines = None;
             self.streamline_loading = false;
+            self.streamline_overlay = None;
             self.streamline_error = Some(error);
+            self.schedule_next_playback_frame();
         } else if let Some((
             generation,
             path,
@@ -953,6 +973,21 @@ impl ViewerApp {
         Duration::from_secs_f32(1.0 / self.playback_fps.clamp(0.5, 30.0))
     }
 
+    fn schedule_next_playback_frame(&mut self) {
+        if !self.playing {
+            self.buffering = false;
+            self.next_frame_at = None;
+            return;
+        }
+        if self.loading || self.streamline_loading {
+            self.buffering = true;
+            self.next_frame_at = None;
+        } else {
+            self.buffering = false;
+            self.next_frame_at = Some(Instant::now() + self.frame_duration());
+        }
+    }
+
     fn pause_playback(&mut self) {
         self.playing = false;
         self.buffering = false;
@@ -964,8 +999,7 @@ impl ViewerApp {
             self.pause_playback();
         } else if self.timeline_indices().len() > 1 && self.plot.lock().unwrap().data.is_some() {
             self.playing = true;
-            self.buffering = false;
-            self.next_frame_at = Some(Instant::now() + self.frame_duration());
+            self.schedule_next_playback_frame();
         }
     }
 
@@ -973,8 +1007,9 @@ impl ViewerApp {
         if !self.playing {
             return;
         }
-        if self.loading {
+        if self.loading || self.streamline_loading {
             self.buffering = true;
+            self.next_frame_at = None;
             return;
         }
         let now = Instant::now();
@@ -2136,7 +2171,12 @@ impl ViewerApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(RichText::new("Computing field lines…").color(MUTED));
+                    let message = if self.streamline_overlay.is_some() {
+                        "Updating field lines… previous frame remains visible"
+                    } else {
+                        "Computing field lines…"
+                    };
+                    ui.label(RichText::new(message).color(MUTED));
                 });
             } else if let Some(error) = &self.streamline_error {
                 ui.add_space(8.0);
@@ -2385,17 +2425,8 @@ impl ViewerApp {
                     );
                     ui.painter()
                         .add(PlotCallback::paint_callback(plot_rect, self.plot.clone()));
-                    if let Some(overlay) = self.streamline_overlay.as_ref().filter(|overlay| {
-                        self.displayed_path.as_deref() == Some(overlay.path.as_str())
-                    }) {
-                        paint_streamlines(
-                            ui,
-                            plot_rect,
-                            display.view_bounds,
-                            overlay,
-                            self.placing_streamline_seed
-                                || self.inspector_tab == InspectorTab::FieldLines,
-                        );
+                    if let Some(overlay) = &self.streamline_overlay {
+                        paint_streamlines(ui, plot_rect, display.view_bounds, overlay);
                     }
 
                     let (section, variable, relative_path) = self.scope_values();
@@ -2601,7 +2632,7 @@ impl ViewerApp {
                 });
             });
         if self.playing && self.playback_fps != previous_fps {
-            self.next_frame_at = Some(Instant::now() + self.frame_duration());
+            self.schedule_next_playback_frame();
         }
         if self.playback_loop != previous_loop {
             self.schedule_prefetch();
@@ -2700,7 +2731,11 @@ impl ViewerApp {
             scope_variable,
             scope_relative_path,
             appearance,
-            streamlines: self.streamline_overlay.clone(),
+            streamlines: self
+                .streamline_overlay
+                .as_ref()
+                .filter(|overlay| self.displayed_path.as_deref() == Some(overlay.path.as_str()))
+                .cloned(),
             chrome: self.plot_chrome(&header),
             logical_size,
             pixels_per_point,
@@ -3589,6 +3624,17 @@ fn next_playback_position(position: usize, frame_count: usize, looping: bool) ->
     }
 }
 
+fn streamline_overlay_matches(
+    overlay: &StreamlineOverlay,
+    section: Option<&str>,
+    horizontal_component: &str,
+    vertical_component: &str,
+) -> bool {
+    overlay.section.as_deref() == section
+        && overlay.horizontal_component == horizontal_component
+        && overlay.vertical_component == vertical_component
+}
+
 fn is_coordinate(name: &str) -> bool {
     let compact = name.to_lowercase().replace(' ', "");
     matches!(compact.as_str(), "x" | "y" | "z")
@@ -3622,6 +3668,30 @@ mod tests {
         assert_eq!(next_playback_position(2, 3, false), None);
         assert_eq!(next_playback_position(2, 3, true), Some(0));
         assert_eq!(next_playback_position(0, 1, true), None);
+    }
+
+    #[test]
+    fn compatible_streamline_overlay_can_bridge_a_timestep_change() {
+        let overlay = StreamlineOverlay {
+            path: "frame-1.plt".into(),
+            section: Some("z=0".into()),
+            horizontal_component: "magnetic_field.x".into(),
+            vertical_component: "magnetic_field.y".into(),
+            lines: Vec::new(),
+            settings: Default::default(),
+        };
+        assert!(streamline_overlay_matches(
+            &overlay,
+            Some("z=0"),
+            "magnetic_field.x",
+            "magnetic_field.y"
+        ));
+        assert!(!streamline_overlay_matches(
+            &overlay,
+            Some("y=0"),
+            "magnetic_field.x",
+            "magnetic_field.z"
+        ));
     }
 
     #[test]

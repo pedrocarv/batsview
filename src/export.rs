@@ -166,7 +166,7 @@ pub fn render_plot_png(frame: ExportFrame) -> Result<PathBuf> {
         ui.painter()
             .add(PlotCallback::paint_callback(plot_rect, frame.plot.clone()));
         if let Some(streamlines) = &frame.streamlines {
-            paint_streamlines(ui, plot_rect, display.view_bounds, streamlines, false);
+            paint_streamlines(ui, plot_rect, display.view_bounds, streamlines);
         }
         let scope = ScopeContext {
             section: frame.scope_section.as_deref(),
