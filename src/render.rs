@@ -7,19 +7,19 @@ use eframe::{
 };
 use wgpu::util::DeviceExt;
 
-use crate::protocol::{PlotData, Vertex};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scale {
-    Linear,
-    Logarithmic,
-}
+use crate::{
+    protocol::{PlotData, Vertex},
+    scene::{AppearanceSettings, ColorMode, Colormap, Scale},
+};
 
 #[derive(Clone, Debug)]
 pub struct DisplayState {
     pub scale: Scale,
     pub limits: [f32; 2],
     pub view_bounds: [f32; 4],
+    pub colormap: Colormap,
+    pub reversed: bool,
+    pub color_mode: ColorMode,
 }
 
 impl Default for DisplayState {
@@ -28,6 +28,9 @@ impl Default for DisplayState {
             scale: Scale::Linear,
             limits: [0.0, 1.0],
             view_bounds: [0.0, 1.0, 0.0, 1.0],
+            colormap: Colormap::Viridis,
+            reversed: false,
+            color_mode: ColorMode::Continuous,
         }
     }
 }
@@ -52,6 +55,31 @@ impl SharedPlot {
         }
         self.data = Some(Arc::new(data));
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn set_appearance(&mut self, appearance: &AppearanceSettings) {
+        self.display.scale = appearance.scale;
+        self.display.colormap = appearance.colormap;
+        self.display.reversed = appearance.reversed;
+        self.display.color_mode = appearance.color_mode;
+        let requested = appearance.color_limits.or_else(|| {
+            self.data.as_ref().map(|data| {
+                if appearance.scale == Scale::Logarithmic {
+                    data.header
+                        .positive_range
+                        .unwrap_or(data.header.value_range)
+                } else {
+                    data.header.value_range
+                }
+            })
+        });
+        if let Some(limits) = requested
+            && limits.into_iter().all(f32::is_finite)
+            && limits[1] > limits[0]
+            && (appearance.scale == Scale::Linear || limits[0] > 0.0)
+        {
+            self.display.limits = limits;
+        }
     }
 
     pub fn reset_view(&mut self) {
@@ -142,7 +170,11 @@ pub struct PlotResources {
 }
 
 impl PlotResources {
-    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target_format: wgpu::TextureFormat,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("BATSView scalar shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("plot.wgsl").into()),
@@ -153,26 +185,64 @@ impl PlotResources {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let colormap_texture = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("BATSView colormap lookup table"),
+                size: wgpu::Extent3d {
+                    width: 256,
+                    height: Colormap::ALL.len() as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &Colormap::lookup_texture(),
+        );
+        let colormap_view = colormap_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("BATSView uniform layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("BATSView uniform bind group"),
             layout: &bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&colormap_view),
+                },
+            ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("BATSView pipeline layout"),
@@ -277,14 +347,14 @@ impl egui_wgpu::CallbackTrait for PlotCallback {
                 positive[1],
             ],
             shape: [
-                0.0,
+                shared.display.colormap.index() as f32,
                 if shared.display.scale == Scale::Logarithmic {
                     1.0
                 } else {
                     0.0
                 },
-                0.0,
-                0.0,
+                if shared.display.reversed { 1.0 } else { 0.0 },
+                shared.display.color_mode.bins().map_or(0.0, f32::from),
             ],
         };
         queue.write_buffer(&gpu.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -353,5 +423,20 @@ mod tests {
         assert_eq!(plot.display.view_bounds, [-2.0, 2.0, -1.0, 1.0]);
         plot.reset_view();
         assert_eq!(plot.display.view_bounds, [-10.0, 10.0, -5.0, 5.0]);
+    }
+
+    #[test]
+    fn logarithmic_auto_limits_use_the_positive_range() {
+        let mut plot = SharedPlot::default();
+        let mut data = plot_data();
+        data.header.value_range = [-5.0, 10.0];
+        data.header.positive_range = Some([0.01, 10.0]);
+        plot.set_data(data);
+        let appearance = AppearanceSettings {
+            scale: Scale::Logarithmic,
+            ..AppearanceSettings::default()
+        };
+        plot.set_appearance(&appearance);
+        assert_eq!(plot.display.limits, [0.01, 10.0]);
     }
 }

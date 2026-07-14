@@ -3,11 +3,15 @@
     windows_subsystem = "windows"
 )]
 
+mod annotations;
 mod app;
 mod bridge;
 mod catalog;
+mod export;
+mod plot_ui;
 mod protocol;
 mod render;
+mod scene;
 
 use app::ViewerApp;
 
@@ -16,8 +20,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("BATSView")
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_inner_size([1360.0, 860.0])
+            .with_min_inner_size([1080.0, 680.0]),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };

@@ -15,11 +15,35 @@ aliases through a small process boundary.
 - Bridge work runs outside the UI process, so a malformed or very large file
   cannot freeze the interface.
 
-This first milestone supports directory browsing, timestep navigation,
-metadata inspection, searchable source/canonical variable names, selective
-variable loading, linear/log color scaling, limits, and GPU pan/zoom/reset.
-Run discovery is performed natively without starting Python, and plot axes can
-be edited directly in data coordinates or adjusted with mouse and button zoom.
+BATSView supports directory browsing, timestep navigation, metadata inspection,
+searchable source/canonical variable names, selective variable loading, editable
+axes, and GPU pan/zoom/reset. Its scientific plot workspace also provides:
+
+- nine continuous or discrete colormaps with reversal and linear/log scaling;
+- automatic or exact colorbar ticks, custom labels, and numeric formatting;
+- template-based or fixed plot titles;
+- plot-coordinate lines, arrows, rectangles, circles/ellipses, polylines,
+  polygons, and text with direct center/size controls, editable handles,
+  styles, scopes, layers, and undo/redo;
+- per-run scene restoration plus portable scene JSON files; and
+- plot-only PNG export at 1x, 2x, or 4x with dark, white, or transparent
+  backgrounds.
+
+Run discovery is performed natively without starting Python. Plot styling and
+annotation edits never reread or modify the source `.plt` files.
+
+## Controls
+
+- Drag empty plot space to pan; use the wheel to zoom; double-click or press
+  `F` to fit the data.
+- Use the drawing toolbar above the plot to add figures. Hold Shift to constrain
+  lines, squares, and circles. Finish multi-point figures with Enter or a
+  double-click; Escape cancels a draft.
+- Drag a selected figure's blue center handle to move it. Rectangle corner and
+  ellipse radius handles resize it; the Annotations inspector also accepts
+  exact center, width/height, and circle radius values.
+- `Ctrl/Cmd+O` opens a run, `Ctrl/Cmd+S` saves a scene, `Ctrl/Cmd+E` exports a
+  PNG, and `Ctrl/Cmd+Z` / `Ctrl/Cmd+Shift+Z` undo and redo scene edits.
 
 ## Development
 

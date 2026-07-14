@@ -139,6 +139,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "eframe",
+ "image",
  "pollster",
  "rfd",
  "serde",
