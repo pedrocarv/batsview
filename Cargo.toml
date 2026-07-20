@@ -10,13 +10,13 @@ homepage = "https://github.com/pedrocarv/batsview"
 product-name = "BATSView"
 identifier = "io.github.pedrocarv.batsview"
 before-packaging-command = "cargo build --release"
-description = "Fast desktop browser and 2-D viewer for BATS-R-US plot files"
-long-description = "BATSView provides native file browsing and GPU-accelerated 2-D visualization for BATS-R-US Tecplot output."
+description = "Fast desktop browser and 2D/3D viewer for BATS-R-US plot files"
+long-description = "BATSView provides native file browsing and GPU-accelerated 2D and 3D visualization, field lines, isosurfaces, and scientific probes for BATS-R-US Tecplot output."
 homepage = "https://github.com/pedrocarv/batsview"
 publisher = "BATSView"
 license-file = "LICENSE"
 category = "Graphics and Design"
-icons = ["packaging/icons/*.png"]
+icons = ["packaging/icons/batsview.png"]
 resources = [{ src = "dist/batsview-bridge", target = "bridge" }]
 binaries = [{ path = "batsview", main = true }]
 file-associations = [
