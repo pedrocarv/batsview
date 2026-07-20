@@ -2,7 +2,9 @@ use eframe::egui::{self, Color32, FontId, Stroke, StrokeKind};
 
 use crate::{
     render::DisplayState,
-    scene::{AppearanceSettings, colorbar_ticks, normalized_value},
+    scene::{
+        AppearanceSettings, DaysideDirection2d, View2dSettings, colorbar_ticks, normalized_value,
+    },
 };
 
 #[derive(Clone, Copy)]
@@ -35,28 +37,28 @@ pub fn paint_plot_chrome(
         export_rect.left_top() + egui::vec2(18.0, 14.0),
         egui::Align2::LEFT_TOP,
         &chrome.title,
-        FontId::proportional(20.0),
+        FontId::proportional(24.0),
         foreground,
     );
     ui.painter().text(
-        export_rect.left_top() + egui::vec2(18.0, 41.0),
+        export_rect.left_top() + egui::vec2(18.0, 46.0),
         egui::Align2::LEFT_TOP,
         &chrome.subtitle,
-        FontId::proportional(11.5),
+        FontId::proportional(13.5),
         muted,
     );
     ui.painter().text(
         plot_rect.center_bottom() + egui::vec2(0.0, 31.0),
         egui::Align2::CENTER_CENTER,
         &chrome.x_label,
-        FontId::proportional(13.0),
+        FontId::proportional(14.5),
         foreground,
     );
     ui.painter().text(
         plot_rect.left_center() - egui::vec2(42.0, 0.0),
         egui::Align2::CENTER_CENTER,
         &chrome.y_label,
-        FontId::proportional(13.0),
+        FontId::proportional(14.5),
         foreground,
     );
     for (position, align, value) in [
@@ -85,15 +87,12 @@ pub fn paint_plot_chrome(
             position,
             align,
             format_value(value),
-            FontId::monospace(10.0),
+            FontId::monospace(12.0),
             muted,
         );
     }
 
-    let bar = egui::Rect::from_min_max(
-        egui::pos2(plot_rect.right() + 20.0, plot_rect.top()),
-        egui::pos2(plot_rect.right() + 40.0, plot_rect.bottom()),
-    );
+    let bar = colorbar_rect_2d(plot_rect);
     for step in 0..96 {
         let top = bar.top() + bar.height() * step as f32 / 96.0;
         let bottom = bar.top() + bar.height() * (step + 1) as f32 / 96.0;
@@ -117,7 +116,7 @@ pub fn paint_plot_chrome(
                 egui::pos2(bar.right() + 8.0, y),
                 egui::Align2::LEFT_CENTER,
                 tick.label,
-                FontId::monospace(10.0),
+                FontId::monospace(12.5),
                 foreground,
             );
         }
@@ -127,7 +126,7 @@ pub fn paint_plot_chrome(
             bar.center_top() - egui::vec2(0.0, 8.0),
             egui::Align2::CENTER_BOTTOM,
             unit,
-            FontId::proportional(10.0),
+            FontId::proportional(12.5),
             muted,
         );
     }
@@ -135,9 +134,127 @@ pub fn paint_plot_chrome(
         export_rect.right_bottom() - egui::vec2(12.0, 10.0),
         egui::Align2::RIGHT_BOTTOM,
         &chrome.filename,
-        FontId::monospace(9.0),
+        FontId::monospace(10.5),
         muted,
     );
+}
+
+pub fn colorbar_rect_2d(plot_rect: egui::Rect) -> egui::Rect {
+    let height = (plot_rect.height() * 0.68)
+        .clamp(60.0, 360.0)
+        .min(plot_rect.height());
+    egui::Rect::from_center_size(
+        egui::pos2(plot_rect.right() + 27.0, plot_rect.center().y),
+        egui::vec2(14.0, height),
+    )
+}
+
+pub fn colorbar_rect_3d(frame_rect: egui::Rect) -> egui::Rect {
+    let height = (frame_rect.height() * 0.56)
+        .clamp(60.0, 340.0)
+        .min(frame_rect.height());
+    egui::Rect::from_center_size(
+        egui::pos2(frame_rect.right() - 82.0, frame_rect.center().y + 10.0),
+        egui::vec2(13.0, height),
+    )
+}
+
+pub fn paint_reference_bodies_2d(
+    ui: &egui::Ui,
+    plot_rect: egui::Rect,
+    bounds: [f32; 4],
+    x_label: &str,
+    y_label: &str,
+    settings: &View2dSettings,
+) {
+    let spans = [bounds[1] - bounds[0], bounds[3] - bounds[2]];
+    if spans
+        .into_iter()
+        .any(|span| !span.is_finite() || span <= 0.0)
+    {
+        return;
+    }
+    let center = egui::pos2(
+        plot_rect.left() + (-bounds[0] / spans[0]) * plot_rect.width(),
+        plot_rect.bottom() - (-bounds[2] / spans[1]) * plot_rect.height(),
+    );
+    let pixels_per_re = (plot_rect.width() / spans[0])
+        .min(plot_rect.height() / spans[1])
+        .abs();
+    let painter = ui.painter().with_clip_rect(plot_rect);
+
+    if settings.show_inner_boundary
+        && settings.inner_boundary_radius.is_finite()
+        && settings.inner_boundary_radius > 0.0
+    {
+        let radius = settings.inner_boundary_radius * pixels_per_re;
+        if radius >= 0.5 {
+            painter.circle_filled(center, radius, Color32::from_rgb(91, 101, 113));
+            painter.circle_stroke(
+                center,
+                radius,
+                Stroke::new(1.2, Color32::from_rgb(176, 187, 199)),
+            );
+        }
+    }
+
+    if !settings.show_earth || !settings.earth_radius.is_finite() || settings.earth_radius <= 0.0 {
+        return;
+    }
+    let radius = settings.earth_radius * pixels_per_re;
+    if radius < 0.5 {
+        return;
+    }
+    painter.circle_filled(center, radius, Color32::BLACK);
+
+    let dayside = dayside_screen_direction(x_label, y_label, settings.dayside_direction);
+    let perpendicular = egui::vec2(-dayside.y, dayside.x);
+    let mut white_half = Vec::with_capacity(27);
+    white_half.push(center);
+    for index in 0..=24 {
+        let angle = -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * index as f32 / 24.0;
+        white_half.push(center + (dayside * angle.cos() + perpendicular * angle.sin()) * radius);
+    }
+    painter.add(egui::Shape::convex_polygon(
+        white_half,
+        Color32::WHITE,
+        Stroke::new(0.0, Color32::TRANSPARENT),
+    ));
+    painter.line_segment(
+        [
+            center - perpendicular * radius,
+            center + perpendicular * radius,
+        ],
+        Stroke::new(1.0, Color32::from_gray(125)),
+    );
+    painter.circle_stroke(center, radius, Stroke::new(1.2, Color32::from_gray(205)));
+}
+
+fn coordinate_axis(label: &str) -> Option<char> {
+    label
+        .trim_start()
+        .chars()
+        .next()
+        .map(|axis| axis.to_ascii_lowercase())
+        .filter(|axis| matches!(axis, 'x' | 'y' | 'z'))
+}
+
+fn dayside_screen_direction(
+    x_label: &str,
+    y_label: &str,
+    direction: DaysideDirection2d,
+) -> egui::Vec2 {
+    let positive_x = if coordinate_axis(x_label) == Some('x') {
+        egui::vec2(1.0, 0.0)
+    } else if coordinate_axis(y_label) == Some('x') {
+        egui::vec2(0.0, -1.0)
+    } else {
+        egui::vec2(1.0, 0.0)
+    };
+    match direction {
+        DaysideDirection2d::PositiveX => positive_x,
+        DaysideDirection2d::NegativeX => -positive_x,
+    }
 }
 
 pub fn fit_plot_rect(outer: egui::Rect, bounds: [f32; 4]) -> egui::Rect {
@@ -187,5 +304,34 @@ mod tests {
         assert!((square.width() - square.height()).abs() < 0.01);
         let wide = fit_plot_rect(outer, [-2.0, 2.0, -0.5, 0.5]);
         assert!((wide.width() / wide.height() - 4.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn colorbars_are_compact_and_centered() {
+        let plot = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 500.0));
+        let bar_2d = colorbar_rect_2d(plot);
+        assert_eq!(bar_2d.width(), 14.0);
+        assert!(bar_2d.height() < plot.height());
+        assert!((bar_2d.center().y - plot.center().y).abs() < 0.01);
+
+        let bar_3d = colorbar_rect_3d(plot);
+        assert_eq!(bar_3d.width(), 13.0);
+        assert!(bar_3d.height() < plot.height());
+    }
+
+    #[test]
+    fn earth_dayside_follows_configured_x_direction() {
+        assert_eq!(
+            dayside_screen_direction("X [Re]", "Y [Re]", DaysideDirection2d::PositiveX),
+            egui::vec2(1.0, 0.0)
+        );
+        assert_eq!(
+            dayside_screen_direction("Y [Re]", "X [Re]", DaysideDirection2d::PositiveX),
+            egui::vec2(0.0, -1.0)
+        );
+        assert_eq!(
+            dayside_screen_direction("X [Re]", "Y [Re]", DaysideDirection2d::NegativeX),
+            egui::vec2(-1.0, 0.0)
+        );
     }
 }

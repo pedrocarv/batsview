@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
@@ -15,17 +16,34 @@ use serde::{Deserialize, Serialize};
 use crate::{
     annotations::{AnnotationEditor, DrawingTool},
     bridge::Bridge,
+    camera3d::Projection3d,
     catalog::{scan_directory, timeline_indices},
-    export::{ExportBackground, ExportFrame, ExportSettings, render_plot_png},
-    loader::{CacheStats, LoaderEvent, PlotKey, PlotLoader, RequestPriority},
-    plot_ui::{PlotChrome, PlotColors, fit_plot_rect, paint_plot_chrome, sample_appearance},
-    protocol::{BRIDGE_PROTOCOL, FileInfo, PlotData, PlotFile, ScanResult},
+    export::{
+        ExportBackground, ExportFrame, ExportFrame3d, ExportSettings, render_plot_png,
+        render_scene3d_png,
+    },
+    loader::{
+        CacheStats, Crop3dRequest, FieldLineTrace3dRequest, IsosurfaceRequest, LoaderEvent,
+        PlotKey, PlotLoader, RequestPriority, SliceAxis, SlicePlaneRequest, Surface3dKey,
+    },
+    plot_ui::{
+        PlotChrome, PlotColors, colorbar_rect_3d, fit_plot_rect, paint_plot_chrome,
+        paint_reference_bodies_2d, sample_appearance,
+    },
+    probe::{ProbeHit, ProbeIndex, ProbeIndexer, camera_ray},
+    protocol::{BRIDGE_PROTOCOL, FieldLines3dData, FileInfo, PlotData, PlotFile, ScanResult},
     render::{PlotCallback, PlotHandle, PlotResources, SharedPlot},
+    render3d::{
+        LayerDisplay3d, Scene3dCallback, Scene3dHandle, Scene3dResources, SharedScene3d,
+        paint_fieldlines3d, paint_scene_overlays,
+    },
     scene::{
         AnnotationGeometry, AnnotationScope, AppearanceSettings, ColorMode, ColorbarTick, Colormap,
-        DashStyle, DataPoint, NumberFormat, RgbaColor, Scale, SceneDocument, ScopeContext,
-        StreamlineDirection, TickMode, TitleConfig, TitleContext, render_title,
-        validate_custom_ticks,
+        CropBox3d, DashStyle, DataPoint, DataPoint3, DaysideDirection2d, IsosurfaceColoring,
+        IsosurfaceLayer, LatitudeSeedSettings, MAX_ISOSURFACE_LAYERS, MAX_PROBE_MEASUREMENTS,
+        MeshBudget, NumberFormat, ProbeDimension, ProbeMeasurement, RgbaColor, Scale,
+        SceneDocument, ScopeContext, StreamlineDirection, TickMode, TitleConfig, TitleContext,
+        colorbar_ticks, normalized_value, render_title, validate_custom_ticks,
     },
     streamlines::{
         StreamlineOverlay, VectorField, paint_streamlines, screen_to_data as streamline_seed_point,
@@ -37,6 +55,13 @@ const ACCENT: Color32 = Color32::from_rgb(70, 160, 235);
 const PANEL_BG: Color32 = Color32::from_rgb(15, 22, 31);
 const DEEP_BG: Color32 = Color32::from_rgb(9, 14, 21);
 const MUTED: Color32 = Color32::from_rgb(145, 158, 173);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ViewMode {
+    #[default]
+    TwoD,
+    ThreeD,
+}
 
 const fn default_cache_limit_mib() -> u32 {
     512
@@ -57,7 +82,7 @@ enum Event {
         result: Result<ScanResult>,
     },
     SceneSaved(Result<Option<PathBuf>>),
-    SceneLoaded(Result<Option<(PathBuf, SceneDocument)>>),
+    SceneLoaded(Box<Result<Option<(PathBuf, SceneDocument)>>>),
     ExportPathChosen {
         path: Option<PathBuf>,
         settings: ExportSettings,
@@ -78,15 +103,24 @@ enum InspectorTab {
     #[default]
     Data,
     Appearance,
+    Surfaces,
     Annotations,
     FieldLines,
     Metadata,
 }
 
 impl InspectorTab {
-    const ALL: [Self; 5] = [
+    const TWO_D: [Self; 5] = [
         Self::Data,
         Self::Appearance,
+        Self::Annotations,
+        Self::FieldLines,
+        Self::Metadata,
+    ];
+    const THREE_D: [Self; 6] = [
+        Self::Data,
+        Self::Appearance,
+        Self::Surfaces,
         Self::Annotations,
         Self::FieldLines,
         Self::Metadata,
@@ -96,6 +130,7 @@ impl InspectorTab {
         match self {
             Self::Data => "Data",
             Self::Appearance => "Appearance",
+            Self::Surfaces => "3D surfaces",
             Self::Annotations => "Annotations",
             Self::FieldLines => "Field lines",
             Self::Metadata => "Metadata",
@@ -106,6 +141,7 @@ impl InspectorTab {
         match self {
             Self::Data => "Data",
             Self::Appearance => "Style",
+            Self::Surfaces => "Surfaces",
             Self::Annotations => "Shapes",
             Self::FieldLines => "Fields",
             Self::Metadata => "Info",
@@ -120,6 +156,7 @@ enum ToolbarIcon {
     Undo,
     Redo,
     StreamlineSeed,
+    Probe,
     Previous,
     Play,
     Pause,
@@ -184,6 +221,8 @@ pub struct ViewerApp {
     sender: mpsc::Sender<Event>,
     receiver: mpsc::Receiver<Event>,
     plot: PlotHandle,
+    scene3d: Scene3dHandle,
+    view_mode: ViewMode,
     directory: Option<PathBuf>,
     recursive: bool,
     files: Vec<PlotFile>,
@@ -220,6 +259,7 @@ pub struct ViewerApp {
     next_frame_at: Option<Instant>,
     scrub_target: Option<usize>,
     scrub_changed_at: Option<Instant>,
+    slice_changed_at: Option<Instant>,
     pending_streamlines: Option<PendingStreamlineLoad>,
     vector_field: Option<ActiveVectorField>,
     streamline_overlay: Option<StreamlineOverlay>,
@@ -227,12 +267,26 @@ pub struct ViewerApp {
     streamline_loading: bool,
     streamline_error: Option<String>,
     placing_streamline_seed: bool,
+    fieldlines3d: Option<Arc<FieldLines3dData>>,
+    active_fieldlines3d_request: Option<u64>,
+    fieldlines3d_loading: bool,
+    fieldlines3d_error: Option<String>,
+    isosurface_drafts: BTreeMap<u64, IsosurfaceLayer>,
+    selected_isosurface: Option<u64>,
+    crop_draft: CropBox3d,
+    probe_indexer: ProbeIndexer,
+    probe_generation: u64,
+    probe_index: Option<Arc<ProbeIndex>>,
+    probe_indexing: bool,
+    probe_mode: bool,
+    hover_probe: Option<ProbeHit>,
 }
 
 impl ViewerApp {
     pub fn new(context: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
         configure_style(&context.egui_ctx);
         let plot = Arc::new(Mutex::new(SharedPlot::default()));
+        let scene3d = Arc::new(Mutex::new(SharedScene3d::default()));
         if let Some(render_state) = &context.wgpu_render_state {
             let resources = PlotResources::new(
                 &render_state.device,
@@ -244,6 +298,16 @@ impl ViewerApp {
                 .write()
                 .callback_resources
                 .insert(resources);
+            let resources3d = Scene3dResources::new(
+                &render_state.device,
+                &render_state.queue,
+                render_state.target_format,
+            );
+            render_state
+                .renderer
+                .write()
+                .callback_resources
+                .insert(resources3d);
         }
         let persisted: PersistedAppState = context
             .storage
@@ -253,7 +317,14 @@ impl ViewerApp {
         let playback_fps = persisted.playback_fps.clamp(0.5, 30.0);
         let playback_loop = persisted.playback_loop;
         let recursive = persisted.recursive;
-        let stored_runs = persisted.recent_runs;
+        let stored_runs = persisted
+            .recent_runs
+            .into_iter()
+            .filter_map(|mut stored| {
+                stored.scene = stored.scene.migrate().ok()?;
+                Some(stored)
+            })
+            .collect();
         let loader = PlotLoader::new(Bridge::discover(), mib_to_bytes(cache_limit_mib));
         let (sender, receiver) = mpsc::channel();
         let mut app = Self {
@@ -261,6 +332,8 @@ impl ViewerApp {
             sender,
             receiver,
             plot,
+            scene3d,
+            view_mode: ViewMode::TwoD,
             directory: None,
             recursive,
             files: Vec::new(),
@@ -300,6 +373,7 @@ impl ViewerApp {
             next_frame_at: None,
             scrub_target: None,
             scrub_changed_at: None,
+            slice_changed_at: None,
             pending_streamlines: None,
             vector_field: None,
             streamline_overlay: None,
@@ -307,6 +381,19 @@ impl ViewerApp {
             streamline_loading: false,
             streamline_error: None,
             placing_streamline_seed: false,
+            fieldlines3d: None,
+            active_fieldlines3d_request: None,
+            fieldlines3d_loading: false,
+            fieldlines3d_error: None,
+            isosurface_drafts: BTreeMap::new(),
+            selected_isosurface: None,
+            crop_draft: CropBox3d::default(),
+            probe_indexer: ProbeIndexer::new(),
+            probe_generation: 0,
+            probe_index: None,
+            probe_indexing: false,
+            probe_mode: false,
+            hover_probe: None,
         };
         if let Some(path) = initial_path {
             if path.is_dir() {
@@ -360,7 +447,17 @@ impl ViewerApp {
         self.streamline_loading = false;
         self.streamline_error = None;
         self.placing_streamline_seed = false;
+        self.fieldlines3d = None;
+        self.active_fieldlines3d_request = None;
+        self.fieldlines3d_loading = false;
+        self.fieldlines3d_error = None;
+        self.probe_generation = self.probe_generation.wrapping_add(1);
+        self.probe_index = None;
+        self.probe_indexing = false;
+        self.hover_probe = None;
         self.plot.lock().unwrap().clear_data();
+        self.scene3d.lock().unwrap().clear_data();
+        self.view_mode = ViewMode::TwoD;
         self.loading = true;
         self.status = format!("Scanning {}…", directory.display());
         let sender = self.sender.clone();
@@ -395,10 +492,210 @@ impl ViewerApp {
         self.request_selected_plot(variable);
     }
 
+    fn surface3d_request_parts(
+        &self,
+    ) -> (
+        Vec<SlicePlaneRequest>,
+        Vec<IsosurfaceRequest>,
+        Crop3dRequest,
+    ) {
+        let planes = [SliceAxis::X, SliceAxis::Y, SliceAxis::Z]
+            .into_iter()
+            .enumerate()
+            .map(|(index, axis)| SlicePlaneRequest {
+                axis,
+                position: self.scene.view3d.slice_fractions[index].clamp(0.0, 1.0),
+                enabled: self.scene.view3d.slice_enabled[index],
+                normalized: true,
+                origin_if_available: self.scene.view3d.slice_auto_origin[index],
+            })
+            .collect();
+        let section = self
+            .info
+            .as_ref()
+            .and_then(|info| info.section.as_deref())
+            .unwrap_or("3d");
+        let isosurfaces = self
+            .scene
+            .isosurfaces_for(Some(section))
+            .iter()
+            .map(|layer| IsosurfaceRequest {
+                id: layer.id,
+                variable: layer.variable.clone(),
+                isovalue: layer.isovalue,
+                color_variable: match &layer.coloring {
+                    IsosurfaceColoring::Solid { .. } => None,
+                    IsosurfaceColoring::Scalar { variable, .. } => Some(variable.clone()),
+                },
+                triangle_limit: layer.mesh_budget.triangle_limit(),
+            })
+            .collect();
+        let crop = Crop3dRequest {
+            enabled: self.scene.view3d.crop.enabled,
+            fractions: self.scene.view3d.crop.fractions,
+        };
+        (planes, isosurfaces, crop)
+    }
+
+    fn current_3d_section(&self) -> &str {
+        self.info
+            .as_ref()
+            .and_then(|info| info.section.as_deref())
+            .or_else(|| {
+                self.displayed_info
+                    .as_ref()
+                    .and_then(|info| info.section.as_deref())
+            })
+            .unwrap_or("3d")
+    }
+
+    fn refresh_surface_drafts(&mut self) {
+        self.isosurface_drafts = self
+            .scene
+            .isosurfaces_for(Some("3d"))
+            .iter()
+            .cloned()
+            .map(|layer| (layer.id, layer))
+            .collect();
+        self.crop_draft = self.scene.view3d.crop;
+        self.selected_isosurface = self
+            .selected_isosurface
+            .filter(|id| self.isosurface_drafts.contains_key(id));
+    }
+
+    fn add_isosurface_draft(&mut self) {
+        if self.isosurface_drafts.len() >= MAX_ISOSURFACE_LAYERS {
+            self.fail(format!(
+                "A scene may contain at most {MAX_ISOSURFACE_LAYERS} isosurfaces"
+            ));
+            return;
+        }
+        let Some(variable) = self.selected_variable.clone() else {
+            self.fail("Select a scalar variable before adding an isosurface".to_owned());
+            return;
+        };
+        let range = self
+            .scene3d
+            .lock()
+            .unwrap()
+            .data
+            .as_ref()
+            .and_then(|data| data.header.volume_value_range)
+            .unwrap_or([0.0, 1.0]);
+        let appearance = self.scene.appearance_for(Some(&variable));
+        let isovalue = if appearance.scale == Scale::Logarithmic && range[0] > 0.0 {
+            f64::from((range[0] * range[1]).sqrt())
+        } else {
+            f64::from(0.5 * (range[0] + range[1]))
+        };
+        let id = self.scene.allocate_isosurface_id();
+        let colors = [
+            [57, 189, 248, 255],
+            [250, 204, 21, 255],
+            [244, 114, 182, 255],
+            [74, 222, 128, 255],
+            [167, 139, 250, 255],
+            [251, 146, 60, 255],
+            [45, 212, 191, 255],
+            [248, 113, 113, 255],
+        ];
+        let layer = IsosurfaceLayer {
+            id,
+            name: format!("{variable} = {isovalue:.4}"),
+            variable,
+            isovalue,
+            coloring: IsosurfaceColoring::Solid {
+                color: RgbaColor(colors[self.isosurface_drafts.len() % colors.len()]),
+            },
+            ..IsosurfaceLayer::default()
+        };
+        self.isosurface_drafts.insert(id, layer);
+        self.selected_isosurface = Some(id);
+        self.inspector_tab = InspectorTab::Surfaces;
+    }
+
+    fn apply_isosurface_draft(&mut self, layer: IsosurfaceLayer) {
+        let section = self.current_3d_section().to_owned();
+        let mut layers = self.scene.isosurfaces_for(Some(&section)).to_vec();
+        if let Some(existing) = layers.iter_mut().find(|candidate| candidate.id == layer.id) {
+            *existing = layer.clone();
+        } else if layers.len() < MAX_ISOSURFACE_LAYERS {
+            layers.push(layer.clone());
+        } else {
+            self.fail(format!(
+                "A scene may contain at most {MAX_ISOSURFACE_LAYERS} isosurfaces"
+            ));
+            return;
+        }
+        self.editor.checkpoint(&self.scene);
+        self.scene.set_isosurfaces_for(Some(&section), layers);
+        self.isosurface_drafts.insert(layer.id, layer);
+        if let Some(variable) = self.selected_variable.clone() {
+            self.request_selected_plot(variable);
+        }
+    }
+
+    fn sync_isosurface_style(&mut self, draft: &IsosurfaceLayer) {
+        let section = self.current_3d_section().to_owned();
+        let mut layers = self.scene.isosurfaces_for(Some(&section)).to_vec();
+        let Some(layer) = layers.iter_mut().find(|layer| layer.id == draft.id) else {
+            return;
+        };
+        layer.name.clone_from(&draft.name);
+        layer.visible = draft.visible;
+        layer.locked = draft.locked;
+        layer.opacity = draft.opacity;
+        match (&mut layer.coloring, &draft.coloring) {
+            (IsosurfaceColoring::Solid { color: target }, IsosurfaceColoring::Solid { color }) => {
+                *target = *color
+            }
+            (
+                IsosurfaceColoring::Scalar {
+                    appearance: target, ..
+                },
+                IsosurfaceColoring::Scalar { appearance, .. },
+            ) => target.clone_from(appearance),
+            _ => {}
+        }
+        self.scene.set_isosurfaces_for(Some(&section), layers);
+        self.sync_plot_appearance();
+    }
+
     fn request_selected_plot(&mut self, variable: String) {
         let Some(path) = self.selected_path.clone() else {
             return;
         };
+        if self.view_mode == ViewMode::ThreeD {
+            let (planes, isosurfaces, crop) = self.surface3d_request_parts();
+            if !planes.iter().any(|plane| plane.enabled) && isosurfaces.is_empty() {
+                self.fail("Enable a 3D slice or add an isosurface".to_owned());
+                return;
+            }
+            let Ok(key) =
+                Surface3dKey::for_file(&path, variable.clone(), 0, &planes, &isosurfaces, crop)
+            else {
+                self.fail(format!("Could not read metadata for {path}"));
+                return;
+            };
+            let reuse_mesh = self
+                .scene3d
+                .lock()
+                .unwrap()
+                .data
+                .as_ref()
+                .map(|data| data.mesh.clone());
+            let request_id = self.loader.load_surface3d(
+                self.load_epoch,
+                key,
+                RequestPriority::Foreground,
+                reuse_mesh,
+            );
+            self.active_plot_request = Some(request_id);
+            self.active_inspect_request = None;
+            self.loading = true;
+            self.status = format!("Extracting 3D surfaces for {variable}…");
+            return;
+        }
         let Ok(key) = PlotKey::for_file(&path, variable.clone(), 0) else {
             self.fail(format!("Could not read metadata for {path}"));
             return;
@@ -458,13 +755,20 @@ impl ViewerApp {
                 }
                 Event::SceneLoaded(result) => {
                     self.io_busy = false;
-                    match result {
+                    match *result {
                         Ok(Some((path, scene))) => {
                             self.editor.checkpoint(&self.scene);
                             self.scene = scene;
+                            self.refresh_surface_drafts();
                             self.editor.selected = None;
                             self.sync_plot_appearance();
-                            self.request_streamlines_for_display();
+                            if self.view_mode == ViewMode::ThreeD {
+                                if let Some(variable) = self.selected_variable.clone() {
+                                    self.request_selected_plot(variable);
+                                }
+                            } else {
+                                self.request_streamlines_for_display();
+                            }
                             self.status = format!("Scene loaded · {}", path.display());
                         }
                         Ok(None) => self.status = "Scene load canceled".to_owned(),
@@ -474,20 +778,43 @@ impl ViewerApp {
                 Event::ExportPathChosen { path, settings } => {
                     self.io_busy = false;
                     if let Some(path) = path {
-                        if let Some(frame) =
-                            self.export_frame(path, settings, context.pixels_per_point())
-                        {
-                            self.io_busy = true;
-                            self.status = "Rendering PNG…".to_owned();
-                            let sender = self.sender.clone();
-                            thread::spawn(move || {
-                                let _ = sender.send(Event::ImageSaved(render_plot_png(frame)));
-                            });
-                        } else {
-                            self.fail(
-                                "No GPU plot is available to export; load a variable first"
-                                    .to_owned(),
-                            );
+                        let sender = self.sender.clone();
+                        let pixels_per_point = context.pixels_per_point();
+                        match self.view_mode {
+                            ViewMode::TwoD => {
+                                if let Some(frame) =
+                                    self.export_frame(path, settings, pixels_per_point)
+                                {
+                                    self.io_busy = true;
+                                    self.status = "Rendering PNG…".to_owned();
+                                    thread::spawn(move || {
+                                        let _ =
+                                            sender.send(Event::ImageSaved(render_plot_png(frame)));
+                                    });
+                                } else {
+                                    self.fail(
+                                        "No GPU plot is available to export; load a variable first"
+                                            .to_owned(),
+                                    );
+                                }
+                            }
+                            ViewMode::ThreeD => {
+                                if let Some(frame) =
+                                    self.export_frame_3d(path, settings, pixels_per_point)
+                                {
+                                    self.io_busy = true;
+                                    self.status = "Rendering 3D PNG…".to_owned();
+                                    thread::spawn(move || {
+                                        let _ = sender
+                                            .send(Event::ImageSaved(render_scene3d_png(frame)));
+                                    });
+                                } else {
+                                    self.fail(
+                                        "No 3D scene is available to export; load a variable first"
+                                            .to_owned(),
+                                    );
+                                }
+                            }
                         }
                     } else {
                         self.status = "Image export canceled".to_owned();
@@ -567,6 +894,18 @@ impl ViewerApp {
                     self.active_inspect_request = None;
                     match result {
                         Ok(info) if info.protocol == BRIDGE_PROTOCOL => {
+                            self.view_mode = if info
+                                .zones
+                                .first()
+                                .is_some_and(|zone| zone.spatial_dimension == 3)
+                            {
+                                self.pending_streamlines = None;
+                                self.vector_field = None;
+                                self.streamline_overlay = None;
+                                ViewMode::ThreeD
+                            } else {
+                                ViewMode::TwoD
+                            };
                             let preserved = self.selected_variable.as_ref().and_then(|selected| {
                                 info.variables
                                     .iter()
@@ -630,7 +969,8 @@ impl ViewerApp {
                                 info.title = data.header.title.clone();
                                 info.section = data.header.section.clone();
                             }
-                            self.plot.lock().unwrap().set_data(data);
+                            self.plot.lock().unwrap().set_data(data.clone());
+                            self.schedule_probe_2d(data);
                             self.sync_plot_appearance();
                             self.loading = false;
                             self.status = if from_cache {
@@ -639,6 +979,105 @@ impl ViewerApp {
                                 format!("{points} points · {triangles} triangles")
                             };
                             self.request_streamlines_for_display();
+                            self.schedule_next_playback_frame();
+                            self.schedule_prefetch();
+                        }
+                        Err(error) => {
+                            self.pause_playback();
+                            self.fail(error);
+                        }
+                    }
+                }
+                LoaderEvent::Surface3d {
+                    request_id,
+                    epoch,
+                    key,
+                    priority: RequestPriority::Foreground,
+                    from_cache,
+                    result,
+                } if epoch == self.load_epoch
+                    && self.active_plot_request == Some(request_id)
+                    && self.selected_path.as_deref() == key.path.to_str()
+                    && self.selected_variable.as_deref() == Some(&key.variable) =>
+                {
+                    self.active_plot_request = None;
+                    match result {
+                        Ok(data) => {
+                            let vertices = data.header.vertex_count;
+                            let triangles = data.header.triangle_count;
+                            let bounds = data.header.bounds;
+                            let view_bounds = data.header.active_bounds();
+                            let resolved_layers = data.header.layers.clone();
+                            self.displayed_path = Some(key.path.to_string_lossy().into_owned());
+                            self.displayed_variable = Some(key.variable);
+                            if self
+                                .info
+                                .as_ref()
+                                .is_some_and(|info| Path::new(&info.path) == key.path.as_path())
+                            {
+                                self.displayed_info = self.info.clone();
+                            } else if let Some(info) = &mut self.displayed_info {
+                                info.path = key.path.to_string_lossy().into_owned();
+                                info.title = data.header.title.clone();
+                                info.section = Some(data.header.section.clone());
+                            }
+                            let fitted_camera = {
+                                let mut scene = self.scene3d.lock().unwrap();
+                                scene.set_data(data.clone());
+                                if let Some(camera) = self
+                                    .scene
+                                    .view3d
+                                    .camera
+                                    .filter(|camera| camera.is_usable_for(view_bounds))
+                                {
+                                    scene.camera = camera;
+                                } else {
+                                    scene.camera.preset_isometric();
+                                    scene.fit();
+                                }
+                                scene.display.opacity = self.scene.view3d.surface_opacity;
+                                scene.display.show_axes = self.scene.view3d.show_axes;
+                                scene.display.show_box = self.scene.view3d.show_box;
+                                scene.display.show_reference_sphere =
+                                    self.scene.view3d.show_reference_sphere;
+                                scene.display.reference_sphere_radius =
+                                    self.scene.view3d.reference_sphere_radius;
+                                scene.camera
+                            };
+                            self.scene.view3d.camera = Some(fitted_camera);
+                            let probe_data = self.scene3d.lock().unwrap().data.clone();
+                            if let Some(probe_data) = probe_data {
+                                self.schedule_probe_3d(probe_data);
+                            }
+                            for layer in resolved_layers.into_iter().filter(|layer| {
+                                layer.kind == crate::protocol::SurfaceLayerKind::Slice
+                            }) {
+                                let Some(axis_name) = layer.axis.as_deref() else {
+                                    continue;
+                                };
+                                let Some(position) = layer.position else {
+                                    continue;
+                                };
+                                let axis = match axis_name {
+                                    "x" => 0,
+                                    "y" => 1,
+                                    _ => 2,
+                                };
+                                self.scene.view3d.slice_fractions[axis] = ((position
+                                    - bounds[axis * 2])
+                                    / (bounds[axis * 2 + 1] - bounds[axis * 2]).max(1.0e-20))
+                                .clamp(0.0, 1.0);
+                            }
+                            self.sync_plot_appearance();
+                            self.loading = false;
+                            self.status = if from_cache {
+                                format!(
+                                    "{vertices} surface vertices · {triangles} triangles · cached"
+                                )
+                            } else {
+                                format!("{vertices} surface vertices · {triangles} triangles")
+                            };
+                            self.request_fieldlines3d_for_display();
                             self.schedule_next_playback_frame();
                             self.schedule_prefetch();
                         }
@@ -657,7 +1096,34 @@ impl ViewerApp {
                 } if epoch == self.load_epoch => {
                     self.accept_streamline_component(request_id, result);
                 }
-                LoaderEvent::Plot { .. } | LoaderEvent::Inspected { .. } => {}
+                LoaderEvent::FieldLines3d {
+                    request_id,
+                    epoch,
+                    key,
+                    from_cache,
+                    result,
+                } if epoch == self.load_epoch
+                    && self.active_fieldlines3d_request == Some(request_id)
+                    && self.displayed_path.as_deref() == key.path.to_str() =>
+                {
+                    let _ = from_cache;
+                    self.active_fieldlines3d_request = None;
+                    self.fieldlines3d_loading = false;
+                    match result {
+                        Ok(lines) => {
+                            self.fieldlines3d = Some(lines);
+                            self.fieldlines3d_error = None;
+                        }
+                        Err(error) => {
+                            self.fieldlines3d_error = Some(error);
+                        }
+                    }
+                    self.schedule_next_playback_frame();
+                }
+                LoaderEvent::Plot { .. }
+                | LoaderEvent::Surface3d { .. }
+                | LoaderEvent::FieldLines3d { .. }
+                | LoaderEvent::Inspected { .. } => {}
             }
         }
     }
@@ -674,6 +1140,265 @@ impl ViewerApp {
             .scene
             .appearance_for(self.displayed_variable.as_deref());
         self.plot.lock().unwrap().set_appearance(&appearance);
+        let mut scene3d = self.scene3d.lock().unwrap();
+        scene3d.set_appearance(&appearance);
+        scene3d.display.opacity = self.scene.view3d.surface_opacity.clamp(0.05, 1.0);
+        scene3d.display.show_axes = self.scene.view3d.show_axes;
+        scene3d.display.show_box = self.scene.view3d.show_box;
+        scene3d.display.show_reference_sphere = self.scene.view3d.show_reference_sphere;
+        scene3d.display.reference_sphere_radius = self.scene.view3d.reference_sphere_radius;
+        let section = scene3d
+            .data
+            .as_ref()
+            .map(|data| data.header.section.as_str());
+        let layer_styles = self
+            .scene
+            .isosurfaces_for(section)
+            .iter()
+            .enumerate()
+            .map(|(order, layer)| LayerDisplay3d {
+                layer_id: layer.id,
+                visible: layer.visible,
+                opacity: layer.opacity,
+                solid_color: match layer.coloring {
+                    IsosurfaceColoring::Solid { color } => Some(color),
+                    IsosurfaceColoring::Scalar { .. } => None,
+                },
+                appearance: match &layer.coloring {
+                    IsosurfaceColoring::Solid { .. } => AppearanceSettings::default(),
+                    IsosurfaceColoring::Scalar { appearance, .. } => appearance.clone(),
+                },
+                order: order as u32,
+            })
+            .collect();
+        scene3d.set_layer_styles(layer_styles);
+    }
+
+    fn active_3d_colorbar(
+        &self,
+        data: &crate::protocol::Surface3dData,
+    ) -> Option<(AppearanceSettings, [f32; 2], String)> {
+        if let Some(id) = self.selected_isosurface {
+            let layer = self
+                .scene
+                .isosurfaces_for(Some(&data.header.section))
+                .iter()
+                .find(|layer| layer.id == id)?;
+            let IsosurfaceColoring::Scalar { appearance, .. } = &layer.coloring else {
+                return None;
+            };
+            let rendered = data
+                .header
+                .layers
+                .iter()
+                .find(|candidate| candidate.layer_id == Some(id))?;
+            let automatic = rendered.value_range?;
+            let requested = appearance.color_limits.unwrap_or(automatic);
+            let limits = if requested.into_iter().all(f32::is_finite)
+                && requested[1] > requested[0]
+                && (appearance.scale == Scale::Linear || requested[0] > 0.0)
+            {
+                requested
+            } else {
+                automatic
+            };
+            return Some((appearance.clone(), limits, rendered.unit.clone()));
+        }
+        let appearance = self
+            .scene
+            .appearance_for(self.displayed_variable.as_deref());
+        let limits = self.scene3d.lock().unwrap().display.limits;
+        Some((appearance, limits, data.header.unit.clone()))
+    }
+
+    fn schedule_probe_2d(&mut self, data: Arc<PlotData>) {
+        self.probe_generation = self.probe_indexer.schedule_2d(data);
+        self.probe_index = None;
+        self.probe_indexing = true;
+        self.hover_probe = None;
+    }
+
+    fn schedule_probe_3d(&mut self, data: Arc<crate::protocol::Surface3dData>) {
+        self.probe_generation = self.probe_indexer.schedule_3d(data);
+        self.probe_index = None;
+        self.probe_indexing = true;
+        self.hover_probe = None;
+    }
+
+    fn poll_probe_index(&mut self) {
+        if let Some(result) = self.probe_indexer.latest()
+            && result.generation == self.probe_generation
+        {
+            self.probe_index = Some(result.index);
+            self.probe_indexing = false;
+        }
+    }
+
+    fn pin_probe(&mut self, hit: ProbeHit, dimension: ProbeDimension) {
+        if self.scene.measurements.len() >= MAX_PROBE_MEASUREMENTS {
+            self.fail(format!(
+                "A scene may contain at most {MAX_PROBE_MEASUREMENTS} probe measurements"
+            ));
+            return;
+        }
+        let (_, scope_variable, relative_path) = self.scope_values();
+        let id = self.scene.allocate_measurement_id();
+        self.editor.checkpoint(&self.scene);
+        self.scene.measurements.push(ProbeMeasurement {
+            id,
+            name: format!("Probe {id}"),
+            dimension,
+            position: hit.position.map(f64::from),
+            value: f64::from(hit.value),
+            variable: hit.variable,
+            unit: hit.unit,
+            relative_path: relative_path.unwrap_or_default(),
+            scope_variable: scope_variable.unwrap_or_default(),
+            layer_id: hit.layer_id,
+            visible: true,
+        });
+    }
+
+    fn measurement_matches_current(&self, measurement: &ProbeMeasurement) -> bool {
+        let (_, variable, relative_path) = self.scope_values();
+        measurement.relative_path == relative_path.unwrap_or_default()
+            && measurement.scope_variable == variable.unwrap_or_default()
+    }
+
+    fn measurement_inspector(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(14.0);
+        section_heading(ui, "Measurements");
+        if self.probe_indexing {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("Probe indexing…").color(MUTED));
+            });
+        } else {
+            ui.label(
+                RichText::new("Hover the plot to inspect values. Press P or select Probe to pin.")
+                    .small()
+                    .color(MUTED),
+            );
+        }
+        let mut delete = None;
+        let mut clear = false;
+        let current: Vec<usize> = self
+            .scene
+            .measurements
+            .iter()
+            .enumerate()
+            .filter_map(|(index, measurement)| {
+                self.measurement_matches_current(measurement)
+                    .then_some(index)
+            })
+            .collect();
+        for index in current {
+            let measurement = &mut self.scene.measurements[index];
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut measurement.visible, "");
+                    ui.text_edit_singleline(&mut measurement.name);
+                    if ui.small_button("Delete").clicked() {
+                        delete = Some(index);
+                    }
+                });
+                ui.monospace(format!(
+                    "({:.3}, {:.3}, {:.3})  {:.6e}{}",
+                    measurement.position[0],
+                    measurement.position[1],
+                    measurement.position[2],
+                    measurement.value,
+                    measurement
+                        .unit
+                        .as_deref()
+                        .map_or(String::new(), |unit| format!(" {unit}"))
+                ));
+            });
+        }
+        if (delete.is_some() || !self.scene.measurements.is_empty())
+            && ui.button("Clear visible plot measurements").clicked()
+        {
+            clear = true;
+        }
+        if let Some(index) = delete {
+            self.editor.checkpoint(&self.scene);
+            self.scene.measurements.remove(index);
+        }
+        if clear {
+            self.editor.checkpoint(&self.scene);
+            let (_, variable, relative_path) = self.scope_values();
+            let variable = variable.unwrap_or_default();
+            let relative_path = relative_path.unwrap_or_default();
+            self.scene.measurements.retain(|measurement| {
+                measurement.scope_variable != variable || measurement.relative_path != relative_path
+            });
+        }
+    }
+
+    fn request_fieldlines3d_for_display(&mut self) {
+        self.loader.cancel_auxiliary();
+        self.active_fieldlines3d_request = None;
+        self.fieldlines3d_loading = false;
+        self.fieldlines3d_error = None;
+
+        let Some(path) = self.displayed_path.clone() else {
+            return;
+        };
+        let data = self.scene3d.lock().unwrap().data.clone();
+        let Some(data) = data else { return };
+        let settings = self.scene.fieldlines3d_for(Some(&data.header.section));
+        if !settings.enabled {
+            self.fieldlines3d = None;
+            return;
+        }
+        let [Some(x), Some(y), Some(z)] = settings.components.clone() else {
+            self.fieldlines3d_error = Some("Choose all three vector components".to_owned());
+            return;
+        };
+        if x == y || x == z || y == z {
+            self.fieldlines3d_error = Some("Vector components must be different".to_owned());
+            return;
+        }
+        let mut seeds: Vec<[f64; 3]> = latitude_footpoints3d(&settings.latitude_seeds)
+            .into_iter()
+            .chain(settings.custom_seeds.iter().copied())
+            .map(DataPoint3::as_array)
+            .collect();
+        if let Some(region) = settings.seed_region {
+            seeds.extend(
+                seed_grid3d(region, settings.region_counts)
+                    .into_iter()
+                    .map(DataPoint3::as_array),
+            );
+        }
+        if seeds.is_empty() {
+            self.fieldlines3d_error =
+                Some("Enable planetary footpoints or add seeds in a custom region".to_owned());
+            return;
+        }
+        match self.loader.trace_fieldlines3d(
+            self.load_epoch,
+            path,
+            0,
+            FieldLineTrace3dRequest {
+                components: [x, y, z],
+                seeds,
+                step: settings.step_size,
+                max_steps: settings.max_steps,
+                max_length: settings.max_length,
+                planet_radius: self.scene.view3d.reference_sphere_radius,
+                crop: Crop3dRequest {
+                    enabled: self.scene.view3d.crop.enabled,
+                    fractions: self.scene.view3d.crop.fractions,
+                },
+            },
+        ) {
+            Ok(request_id) => {
+                self.active_fieldlines3d_request = Some(request_id);
+                self.fieldlines3d_loading = true;
+            }
+            Err(error) => self.fieldlines3d_error = Some(error),
+        }
     }
 
     fn request_streamlines_for_display(&mut self) {
@@ -887,6 +1612,12 @@ impl ViewerApp {
         let Some(key) = self.current_run_key.clone() else {
             return;
         };
+        if self.view_mode == ViewMode::ThreeD {
+            let shared = self.scene3d.lock().unwrap();
+            if shared.data.is_some() {
+                self.scene.view3d.camera = Some(shared.camera);
+            }
+        }
         self.stored_runs.retain(|stored| stored.key != key);
         self.stored_runs.insert(
             0,
@@ -913,7 +1644,10 @@ impl ViewerApp {
             .iter()
             .position(|stored| stored.key == key)
             .map(|index| self.stored_runs.remove(index).scene);
-        self.scene = restored.unwrap_or_default();
+        self.scene = restored
+            .and_then(|scene| scene.migrate().ok())
+            .unwrap_or_default();
+        self.refresh_surface_drafts();
         if self.scene.source_run.is_none() {
             self.scene.source_run = Path::new(&directory)
                 .file_name()
@@ -979,7 +1713,7 @@ impl ViewerApp {
             self.next_frame_at = None;
             return;
         }
-        if self.loading || self.streamline_loading {
+        if self.loading || self.streamline_loading || self.fieldlines3d_loading {
             self.buffering = true;
             self.next_frame_at = None;
         } else {
@@ -997,7 +1731,12 @@ impl ViewerApp {
     fn toggle_playback(&mut self) {
         if self.playing {
             self.pause_playback();
-        } else if self.timeline_indices().len() > 1 && self.plot.lock().unwrap().data.is_some() {
+        } else if self.timeline_indices().len() > 1
+            && match self.view_mode {
+                ViewMode::TwoD => self.plot.lock().unwrap().data.is_some(),
+                ViewMode::ThreeD => self.scene3d.lock().unwrap().data.is_some(),
+            }
+        {
             self.playing = true;
             self.schedule_next_playback_frame();
         }
@@ -1007,7 +1746,7 @@ impl ViewerApp {
         if !self.playing {
             return;
         }
-        if self.loading || self.streamline_loading {
+        if self.loading || self.streamline_loading || self.fieldlines3d_loading {
             self.buffering = true;
             self.next_frame_at = None;
             return;
@@ -1033,6 +1772,28 @@ impl ViewerApp {
         self.request_timeline_position(next, false);
     }
 
+    fn slice_debounce_tick(&mut self, context: &egui::Context) {
+        if self.view_mode != ViewMode::ThreeD
+            || self
+                .slice_changed_at
+                .is_none_or(|changed| changed.elapsed() < Duration::from_millis(100))
+            || context.input(|input| input.pointer.primary_down())
+        {
+            return;
+        }
+        self.slice_changed_at = None;
+        if self
+            .scene
+            .view3d
+            .slice_enabled
+            .into_iter()
+            .any(|enabled| enabled)
+            && let Some(variable) = self.selected_variable.clone()
+        {
+            self.request_selected_plot(variable);
+        }
+    }
+
     fn schedule_prefetch(&mut self) {
         let timeline = self.timeline_indices();
         if timeline.len() < 2 {
@@ -1044,13 +1805,6 @@ impl ViewerApp {
         let Some(variable) = self.displayed_variable.clone() else {
             return;
         };
-        let reuse_mesh = self
-            .plot
-            .lock()
-            .unwrap()
-            .data
-            .as_ref()
-            .map(|data| data.mesh.clone());
         let previous = if position > 0 {
             Some(position - 1)
         } else {
@@ -1061,6 +1815,37 @@ impl ViewerApp {
         } else {
             self.playback_loop.then_some(0)
         };
+        if self.view_mode == ViewMode::ThreeD {
+            let reuse_mesh = self
+                .scene3d
+                .lock()
+                .unwrap()
+                .data
+                .as_ref()
+                .map(|data| data.mesh.clone());
+            let (planes, isosurfaces, crop) = self.surface3d_request_parts();
+            for neighbor in [previous, next].into_iter().flatten() {
+                let path = self.files[timeline[neighbor]].path.clone();
+                if let Ok(key) =
+                    Surface3dKey::for_file(path, variable.clone(), 0, &planes, &isosurfaces, crop)
+                {
+                    self.loader.load_surface3d(
+                        self.load_epoch,
+                        key,
+                        RequestPriority::Prefetch,
+                        reuse_mesh.clone(),
+                    );
+                }
+            }
+            return;
+        }
+        let reuse_mesh = self
+            .plot
+            .lock()
+            .unwrap()
+            .data
+            .as_ref()
+            .map(|data| data.mesh.clone());
         for neighbor in [previous, next].into_iter().flatten() {
             let path = self.files[timeline[neighbor]].path.clone();
             if let Ok(key) = PlotKey::for_file(path, variable.clone(), 0) {
@@ -1076,6 +1861,9 @@ impl ViewerApp {
 
     fn save_scene_dialog(&mut self) {
         self.io_busy = true;
+        if self.view_mode == ViewMode::ThreeD {
+            self.scene.view3d.camera = Some(self.scene3d.lock().unwrap().camera);
+        }
         let scene = self.scene.clone();
         let sender = self.sender.clone();
         let directory = self.directory.clone();
@@ -1120,11 +1908,11 @@ impl ViewerApp {
                         .with_context(|| format!("reading scene from {}", path.display()))?;
                     let scene: SceneDocument =
                         serde_json::from_slice(&bytes).context("parsing BATSView scene")?;
-                    scene.validate()?;
+                    let scene = scene.migrate()?;
                     Ok((path, scene))
                 })
                 .transpose();
-            let _ = sender.send(Event::SceneLoaded(result));
+            let _ = sender.send(Event::SceneLoaded(Box::new(result)));
         });
     }
 
@@ -1166,7 +1954,10 @@ impl ViewerApp {
         if context.input_mut(|input| {
             input.consume_shortcut(&KeyboardShortcut::new(command, egui::Key::E))
         }) {
-            self.show_export_dialog = self.plot.lock().unwrap().data.is_some();
+            self.show_export_dialog = match self.view_mode {
+                ViewMode::TwoD => self.plot.lock().unwrap().data.is_some(),
+                ViewMode::ThreeD => self.scene3d.lock().unwrap().data.is_some(),
+            };
         }
         let undo = context.input_mut(|input| {
             input.consume_shortcut(&KeyboardShortcut::new(command, egui::Key::Z))
@@ -1194,13 +1985,29 @@ impl ViewerApp {
             if context.input(|input| input.key_pressed(egui::Key::Space)) {
                 self.toggle_playback();
             }
+            if context.input(|input| input.key_pressed(egui::Key::P)) {
+                self.probe_mode = !self.probe_mode;
+                self.placing_streamline_seed = false;
+                self.editor.cancel_drawing();
+                self.editor.tool = DrawingTool::Select;
+                self.inspector_tab = InspectorTab::Data;
+            }
             if context.input(|input| {
                 input.key_pressed(egui::Key::Delete) || input.key_pressed(egui::Key::Backspace)
             }) {
                 self.editor.delete_selected(&mut self.scene);
             }
             if context.input(|input| input.key_pressed(egui::Key::F)) {
-                self.plot.lock().unwrap().reset_view();
+                match self.view_mode {
+                    ViewMode::TwoD => self.plot.lock().unwrap().reset_view(),
+                    ViewMode::ThreeD => {
+                        let mut scene = self.scene3d.lock().unwrap();
+                        scene.fit();
+                        if scene.data.is_some() {
+                            self.scene.view3d.camera = Some(scene.camera);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1223,7 +2030,11 @@ impl ViewerApp {
                                 .strong()
                                 .color(Color32::WHITE),
                         );
-                        ui.label(RichText::new("SCIENTIFIC 2D VIEWER").size(9.0).color(MUTED));
+                        ui.label(
+                            RichText::new("SCIENTIFIC DATA VIEWER")
+                                .size(9.0)
+                                .color(MUTED),
+                        );
                     });
                     ui.add_space(10.0);
                     ui.separator();
@@ -1251,7 +2062,24 @@ impl ViewerApp {
                             }
                         });
                     });
-                    let has_plot = self.plot.lock().unwrap().data.is_some();
+                    if self.view_mode == ViewMode::ThreeD
+                        && ui
+                            .add_enabled(
+                                self.selected_variable.is_some()
+                                    && self.isosurface_drafts.len() < MAX_ISOSURFACE_LAYERS,
+                                egui::Button::new("+ Isosurface"),
+                            )
+                            .on_hover_text(
+                                "Add an optional 3D isosurface from the selected variable",
+                            )
+                            .clicked()
+                    {
+                        self.add_isosurface_draft();
+                    }
+                    let has_plot = match self.view_mode {
+                        ViewMode::TwoD => self.plot.lock().unwrap().data.is_some(),
+                        ViewMode::ThreeD => self.scene3d.lock().unwrap().data.is_some(),
+                    };
                     if ui
                         .add_enabled(has_plot, egui::Button::new("Export PNG"))
                         .on_hover_text("Export the plot as PNG  Ctrl/Cmd+E")
@@ -1332,24 +2160,29 @@ impl ViewerApp {
                         );
                     });
                 } else {
-                    egui::ScrollArea::vertical().show_rows(ui, 54.0, visible.len(), |ui, range| {
+                    egui::ScrollArea::vertical().show_rows(ui, 62.0, visible.len(), |ui, range| {
                         for row in range {
                             let file = &self.files[visible[row]];
                             let selected = self.selected_path.as_deref() == Some(&file.path);
-                            let primary = file.section.as_deref().unwrap_or(&file.name);
-                            let secondary = if let Some(time) = file.time_step {
-                                format!("t={time}  ·  {:.1} MB", file.size as f64 / 1_048_576.0)
-                            } else {
-                                format!("{:.1} MB", file.size as f64 / 1_048_576.0)
-                            };
-                            let label = format!("{primary}\n{secondary}");
-                            if ui
-                                .add_sized(
-                                    [ui.available_width(), 48.0],
-                                    egui::Button::selectable(selected, label),
-                                )
-                                .on_hover_text(&file.name)
-                                .clicked()
+                            let mut details = Vec::new();
+                            if let Some(section) = &file.section {
+                                details.push(section.clone());
+                            }
+                            if let Some(time) = file.time_step {
+                                details.push(format!("t={time}"));
+                            }
+                            if let Some(dump) = file.dump_index {
+                                details.push(format!("n={dump}"));
+                            }
+                            details.push(format!("{:.1} MB", file.size as f64 / 1_048_576.0));
+                            if selectable_metadata_row(
+                                ui,
+                                selected,
+                                &file.name,
+                                &details.join("  ·  "),
+                            )
+                            .on_hover_text(&file.path)
+                            .clicked()
                             {
                                 self.inspect(file.path.clone());
                             }
@@ -1370,21 +2203,30 @@ impl ViewerApp {
                     .inner_margin(egui::Margin::symmetric(12, 12)),
             )
             .show(root, |ui| {
+                let tabs: &[InspectorTab] = if self.view_mode == ViewMode::ThreeD {
+                    &InspectorTab::THREE_D
+                } else {
+                    &InspectorTab::TWO_D
+                };
                 ui.horizontal(|ui| {
-                    let count = InspectorTab::ALL.len() as f32;
+                    let count = tabs.len() as f32;
                     let width = (ui.available_width()
                         - (count - 1.0) * ui.spacing().item_spacing.x)
                         / count;
-                    for tab in InspectorTab::ALL {
+                    for &tab in tabs {
+                        let (short_name, full_name) = if self.view_mode == ViewMode::ThreeD
+                            && tab == InspectorTab::Annotations
+                        {
+                            ("Scene", "3D scene")
+                        } else {
+                            (tab.short_name(), tab.name())
+                        };
                         if ui
                             .add_sized(
                                 [width, 32.0],
-                                egui::Button::selectable(
-                                    self.inspector_tab == tab,
-                                    tab.short_name(),
-                                ),
+                                egui::Button::selectable(self.inspector_tab == tab, short_name),
                             )
-                            .on_hover_text(tab.name())
+                            .on_hover_text(full_name)
                             .clicked()
                         {
                             self.inspector_tab = tab;
@@ -1397,7 +2239,14 @@ impl ViewerApp {
                 egui::ScrollArea::vertical().show(ui, |ui| match self.inspector_tab {
                     InspectorTab::Data => self.data_inspector(ui),
                     InspectorTab::Appearance => self.appearance_inspector(ui),
+                    InspectorTab::Surfaces => self.surface3d_inspector(ui),
+                    InspectorTab::Annotations if self.view_mode == ViewMode::ThreeD => {
+                        self.scene3d_inspector(ui)
+                    }
                     InspectorTab::Annotations => self.annotation_inspector(ui),
+                    InspectorTab::FieldLines if self.view_mode == ViewMode::ThreeD => {
+                        self.fieldline3d_inspector(ui)
+                    }
                     InspectorTab::FieldLines => self.streamline_inspector(ui),
                     InspectorTab::Metadata => self.metadata_inspector(ui),
                 });
@@ -1427,22 +2276,12 @@ impl ViewerApp {
                         }
                         let selected =
                             self.selected_variable.as_deref() == Some(&variable.canonical);
-                        let mut text = if variable.canonical == variable.source {
-                            variable.source.clone()
-                        } else {
-                            format!("{}\n{}", variable.canonical, variable.source)
-                        };
+                        let mut secondary = format!("Source: {}", variable.source);
                         if let Some(unit) = &variable.unit {
-                            text.push_str(&format!("  [{unit}]"));
+                            secondary.push_str(&format!("  ·  [{unit}]"));
                         }
-                        if ui
-                            .add_sized(
-                                [
-                                    ui.available_width(),
-                                    if text.contains('\n') { 40.0 } else { 28.0 },
-                                ],
-                                egui::Button::selectable(selected, text),
-                            )
+                        if selectable_metadata_row(ui, selected, &variable.canonical, &secondary)
+                            .on_hover_text(format!("{} · {}", variable.canonical, secondary))
                             .clicked()
                         {
                             requested = Some(variable.canonical.clone());
@@ -1454,6 +2293,26 @@ impl ViewerApp {
         }
         if let Some(variable) = requested {
             self.load_variable(variable);
+        }
+
+        if self.view_mode == ViewMode::ThreeD {
+            ui.add_space(14.0);
+            section_heading(ui, "3D dataset");
+            if let Some(zone) = self.info.as_ref().and_then(|info| info.zones.first()) {
+                ui.label(format!("{} · {} points", zone.zone_type, zone.num_points));
+                ui.label(
+                    RichText::new(format!("{} volume cells", zone.num_elements))
+                        .small()
+                        .color(MUTED),
+                );
+            }
+            ui.small(
+                RichText::new("Rotate: left drag · Pan: right drag · Zoom: wheel · Fit: F")
+                    .color(MUTED),
+            );
+            self.measurement_inspector(ui);
+            self.performance_inspector(ui);
+            return;
         }
 
         ui.add_space(14.0);
@@ -1482,6 +2341,11 @@ impl ViewerApp {
         );
         drop(shared);
 
+        self.measurement_inspector(ui);
+        self.performance_inspector(ui);
+    }
+
+    fn performance_inspector(&mut self, ui: &mut egui::Ui) {
         ui.add_space(14.0);
         section_heading(ui, "Performance");
         let before = self.cache_limit_mib;
@@ -1512,6 +2376,685 @@ impl ViewerApp {
         }
     }
 
+    fn surface3d_inspector(&mut self, ui: &mut egui::Ui) {
+        section_heading(ui, "3D surfaces");
+        ui.label(
+            RichText::new(
+                "Slices remain available by default. Isosurfaces are added only when you choose to create one.",
+            )
+            .small()
+            .color(MUTED),
+        );
+        if ui
+            .add_enabled(
+                self.selected_variable.is_some()
+                    && self.isosurface_drafts.len() < MAX_ISOSURFACE_LAYERS,
+                egui::Button::new("+ Add isosurface"),
+            )
+            .clicked()
+        {
+            self.add_isosurface_draft();
+        }
+        if ui
+            .selectable_label(
+                self.selected_isosurface.is_none(),
+                "Slice group · use the plot colorbar",
+            )
+            .clicked()
+        {
+            self.selected_isosurface = None;
+        }
+
+        ui.add_space(14.0);
+        section_heading(ui, "Shared crop box");
+        let bounds = self
+            .scene3d
+            .lock()
+            .unwrap()
+            .data
+            .as_ref()
+            .map(|data| data.header.bounds);
+        let mut crop = self.crop_draft;
+        ui.checkbox(&mut crop.enabled, "Crop all 3D data geometry");
+        if crop.enabled {
+            for (axis, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    let low = axis * 2;
+                    let high = low + 1;
+                    let high_fraction = crop.fractions[high];
+                    ui.add(
+                        egui::DragValue::new(&mut crop.fractions[low])
+                            .range(0.0..=high_fraction - 0.001)
+                            .speed(0.005)
+                            .prefix("min "),
+                    );
+                    let low_fraction = crop.fractions[low];
+                    ui.add(
+                        egui::DragValue::new(&mut crop.fractions[high])
+                            .range(low_fraction + 0.001..=1.0)
+                            .speed(0.005)
+                            .prefix("max "),
+                    );
+                    if let Some(bounds) = bounds {
+                        let span = bounds[high] - bounds[low];
+                        let actual_low = bounds[low] + crop.fractions[low] * span;
+                        let actual_high = bounds[low] + crop.fractions[high] * span;
+                        ui.label(
+                            RichText::new(format!("{actual_low:.2}…{actual_high:.2}"))
+                                .small()
+                                .color(MUTED),
+                        );
+                    }
+                });
+            }
+        }
+        self.crop_draft = crop;
+        ui.horizontal(|ui| {
+            if ui.button("Apply crop").clicked() {
+                self.editor.checkpoint(&self.scene);
+                self.scene.view3d.crop = self.crop_draft;
+                if let Some(variable) = self.selected_variable.clone() {
+                    self.request_selected_plot(variable);
+                }
+            }
+            if ui.button("Reset full domain").clicked() {
+                self.crop_draft = CropBox3d::default();
+                self.scene.view3d.crop = self.crop_draft;
+                if let Some(variable) = self.selected_variable.clone() {
+                    self.request_selected_plot(variable);
+                }
+            }
+        });
+
+        ui.add_space(14.0);
+        section_heading(ui, "Isosurface layers");
+        let variables = self
+            .info
+            .as_ref()
+            .map(|info| {
+                info.variables
+                    .iter()
+                    .filter(|variable| !is_coordinate(&variable.source))
+                    .map(|variable| (variable.canonical.clone(), variable.source.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let rendered_layers = self
+            .scene3d
+            .lock()
+            .unwrap()
+            .data
+            .as_ref()
+            .map(|data| data.header.layers.clone())
+            .unwrap_or_default();
+        let section = self.current_3d_section().to_owned();
+        let applied_order = self
+            .scene
+            .isosurfaces_for(Some(&section))
+            .iter()
+            .map(|layer| layer.id)
+            .collect::<Vec<_>>();
+        let mut ids = applied_order.clone();
+        let draft_only = self
+            .isosurface_drafts
+            .keys()
+            .copied()
+            .filter(|id| !ids.contains(id))
+            .collect::<Vec<_>>();
+        ids.extend(draft_only);
+        if ids.is_empty() {
+            ui.label(
+                RichText::new("No isosurfaces have been added.")
+                    .italics()
+                    .color(MUTED),
+            );
+        }
+        for id in ids {
+            let Some(mut draft) = self.isosurface_drafts.get(&id).cloned() else {
+                continue;
+            };
+            let before = draft.clone();
+            let applied = applied_order.contains(&id);
+            let selected = self.selected_isosurface == Some(id);
+            let mut apply = false;
+            let mut duplicate = false;
+            let mut delete = false;
+            let mut move_by = 0_i32;
+            egui::Frame::group(ui.style())
+                .fill(if selected {
+                    Color32::from_rgb(24, 38, 53)
+                } else {
+                    PANEL_BG
+                })
+                .inner_margin(egui::Margin::same(9))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(selected, if applied { "Surface" } else { "Draft" })
+                            .clicked()
+                        {
+                            self.selected_isosurface = Some(id);
+                        }
+                        ui.text_edit_singleline(&mut draft.name);
+                        ui.checkbox(&mut draft.visible, "Visible");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Variable");
+                        egui::ComboBox::from_id_salt(("iso_variable", id))
+                            .selected_text(&draft.variable)
+                            .show_ui(ui, |ui| {
+                                for (canonical, source) in &variables {
+                                    ui.selectable_value(
+                                        &mut draft.variable,
+                                        canonical.clone(),
+                                        format!("{canonical}  ·  {source}"),
+                                    );
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Exact isovalue");
+                        let speed = draft.isovalue.abs().max(1.0) * 0.002;
+                        ui.add(egui::DragValue::new(&mut draft.isovalue).speed(speed));
+                    });
+                    ui.add(egui::Slider::new(&mut draft.opacity, 0.05..=1.0).text("Opacity"));
+                    let scalar = matches!(draft.coloring, IsosurfaceColoring::Scalar { .. });
+                    let mut scalar_mode = scalar;
+                    ui.horizontal(|ui| {
+                        ui.label("Color");
+                        ui.selectable_value(&mut scalar_mode, false, "Solid");
+                        ui.selectable_value(&mut scalar_mode, true, "Scalar variable");
+                    });
+                    if scalar_mode != scalar {
+                        draft.coloring = if scalar_mode {
+                            IsosurfaceColoring::Scalar {
+                                variable: draft.variable.clone(),
+                                appearance: self.scene.appearance_for(Some(&draft.variable)),
+                            }
+                        } else {
+                            IsosurfaceColoring::Solid {
+                                color: RgbaColor::default(),
+                            }
+                        };
+                    }
+                    match &mut draft.coloring {
+                        IsosurfaceColoring::Solid { color } => {
+                            let mut edited = color.to_egui();
+                            if ui.color_edit_button_srgba(&mut edited).changed() {
+                                *color = RgbaColor::from_egui(edited);
+                            }
+                        }
+                        IsosurfaceColoring::Scalar {
+                            variable,
+                            appearance,
+                        } => {
+                            egui::ComboBox::from_id_salt(("iso_color_variable", id))
+                                .selected_text(variable.as_str())
+                                .show_ui(ui, |ui| {
+                                    for (canonical, source) in &variables {
+                                        ui.selectable_value(
+                                            variable,
+                                            canonical.clone(),
+                                            format!("{canonical}  ·  {source}"),
+                                        );
+                                    }
+                                });
+                            ui.horizontal(|ui| {
+                                ui.label("Colormap");
+                                egui::ComboBox::from_id_salt(("iso_colormap", id))
+                                    .selected_text(appearance.colormap.name())
+                                    .show_ui(ui, |ui| {
+                                        for map in Colormap::ALL {
+                                            ui.selectable_value(
+                                                &mut appearance.colormap,
+                                                map,
+                                                map.name(),
+                                            );
+                                        }
+                                    });
+                                ui.checkbox(&mut appearance.reversed, "Reverse");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut appearance.scale, Scale::Linear, "Linear");
+                                ui.selectable_value(
+                                    &mut appearance.scale,
+                                    Scale::Logarithmic,
+                                    "Log",
+                                );
+                            });
+                            ui.collapsing("Scalar colorbar options", |ui| {
+                                paint_colormap_preview(ui, appearance);
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .selectable_label(
+                                            appearance.color_mode == ColorMode::Continuous,
+                                            "Continuous",
+                                        )
+                                        .clicked()
+                                    {
+                                        appearance.color_mode = ColorMode::Continuous;
+                                    }
+                                    let discrete =
+                                        matches!(appearance.color_mode, ColorMode::Discrete { .. });
+                                    if ui.selectable_label(discrete, "Discrete").clicked()
+                                        && !discrete
+                                    {
+                                        appearance.color_mode = ColorMode::Discrete { bins: 10 };
+                                    }
+                                });
+                                if let ColorMode::Discrete { bins } = &mut appearance.color_mode {
+                                    ui.add(egui::Slider::new(bins, 2..=32).text("Bins"));
+                                }
+                                let effective_limits = rendered_layers
+                                    .iter()
+                                    .find(|layer| layer.layer_id == Some(id))
+                                    .and_then(|layer| layer.value_range)
+                                    .unwrap_or([0.0, 1.0]);
+                                let mut automatic = appearance.color_limits.is_none();
+                                if ui.checkbox(&mut automatic, "Automatic limits").changed() {
+                                    appearance.color_limits =
+                                        (!automatic).then_some(effective_limits);
+                                }
+                                if let Some(limits) = &mut appearance.color_limits {
+                                    let speed = color_limit_speed(*limits);
+                                    ui.horizontal(|ui| {
+                                        ui.add(egui::DragValue::new(&mut limits[0]).speed(speed));
+                                        ui.label("to");
+                                        ui.add(egui::DragValue::new(&mut limits[1]).speed(speed));
+                                    });
+                                    if !limits.iter().all(|value| value.is_finite())
+                                        || limits[1] <= limits[0]
+                                        || (appearance.scale == Scale::Logarithmic
+                                            && limits[0] <= 0.0)
+                                    {
+                                        ui.colored_label(
+                                            Color32::from_rgb(241, 126, 126),
+                                            "Enter ordered finite limits (positive for log scale).",
+                                        );
+                                    }
+                                }
+                                tick_controls(ui, appearance, effective_limits);
+                            });
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Triangle budget");
+                        egui::ComboBox::from_id_salt(("iso_budget", id))
+                            .selected_text(match draft.mesh_budget {
+                                MeshBudget::Auto => "Auto · 500k".to_owned(),
+                                MeshBudget::Limited(limit) => format!("{}k", limit / 1000),
+                                MeshBudget::Full => "Full".to_owned(),
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut draft.mesh_budget,
+                                    MeshBudget::Auto,
+                                    "Auto · 500k",
+                                );
+                                for limit in [100_000, 250_000, 500_000, 1_000_000, 2_000_000] {
+                                    ui.selectable_value(
+                                        &mut draft.mesh_budget,
+                                        MeshBudget::Limited(limit),
+                                        format!("{}k", limit / 1000),
+                                    );
+                                }
+                                ui.selectable_value(
+                                    &mut draft.mesh_budget,
+                                    MeshBudget::Full,
+                                    "Full",
+                                );
+                            });
+                    });
+                    if !draft.isovalue.is_finite() || draft.variable.trim().is_empty() {
+                        ui.colored_label(
+                            Color32::from_rgb(241, 126, 126),
+                            "Choose a variable and enter a finite isovalue.",
+                        );
+                    }
+                    if let Some(header) = rendered_layers
+                        .iter()
+                        .find(|layer| layer.layer_id == Some(id))
+                    {
+                        if let Some(error) = &header.inactive_reason {
+                            ui.colored_label(Color32::from_rgb(241, 166, 92), error);
+                        } else {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} triangles{}",
+                                    header.rendered_triangles,
+                                    if header.source_triangles > header.rendered_triangles {
+                                        format!(" · reduced from {}", header.source_triangles)
+                                    } else {
+                                        String::new()
+                                    }
+                                ))
+                                .small()
+                                .color(MUTED),
+                            );
+                        }
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        apply = ui
+                            .add_enabled(
+                                draft.isovalue.is_finite() && !draft.variable.trim().is_empty(),
+                                egui::Button::new(if applied { "Apply changes" } else { "Apply" }),
+                            )
+                            .clicked();
+                        duplicate = ui.button("Duplicate").clicked();
+                        ui.add_enabled_ui(applied, |ui| {
+                            if ui.small_button("Up").clicked() {
+                                move_by = -1;
+                            }
+                            if ui.small_button("Down").clicked() {
+                                move_by = 1;
+                            }
+                        });
+                        delete = ui.button("Delete").clicked();
+                        ui.checkbox(&mut draft.locked, "Lock");
+                    });
+                });
+            if draft != before {
+                self.isosurface_drafts.insert(id, draft.clone());
+                self.sync_isosurface_style(&draft);
+            }
+            if apply {
+                self.apply_isosurface_draft(draft.clone());
+            }
+            if duplicate && self.isosurface_drafts.len() < MAX_ISOSURFACE_LAYERS {
+                let duplicate_id = self.scene.allocate_isosurface_id();
+                let mut copy = draft.clone();
+                copy.id = duplicate_id;
+                copy.name = format!("{} copy", copy.name);
+                self.isosurface_drafts.insert(duplicate_id, copy);
+                self.selected_isosurface = Some(duplicate_id);
+            }
+            if move_by != 0 && applied {
+                let mut layers = self.scene.isosurfaces_for(Some(&section)).to_vec();
+                if let Some(index) = layers.iter().position(|layer| layer.id == id) {
+                    let target =
+                        (index as i32 + move_by).clamp(0, layers.len() as i32 - 1) as usize;
+                    let layer = layers.remove(index);
+                    layers.insert(target, layer);
+                    self.scene.set_isosurfaces_for(Some(&section), layers);
+                    self.sync_plot_appearance();
+                }
+            }
+            if delete {
+                let mut layers = self.scene.isosurfaces_for(Some(&section)).to_vec();
+                let was_applied = layers.iter().any(|layer| layer.id == id);
+                layers.retain(|layer| layer.id != id);
+                self.scene.set_isosurfaces_for(Some(&section), layers);
+                self.isosurface_drafts.remove(&id);
+                self.selected_isosurface = None;
+                if was_applied
+                    && self.scene.isosurfaces_for(Some(&section)).is_empty()
+                    && !self
+                        .scene
+                        .view3d
+                        .slice_enabled
+                        .into_iter()
+                        .any(|enabled| enabled)
+                {
+                    self.scene.view3d.slice_enabled[0] = true;
+                }
+                if was_applied && let Some(variable) = self.selected_variable.clone() {
+                    self.request_selected_plot(variable);
+                }
+            }
+            ui.add_space(7.0);
+        }
+    }
+
+    fn scene3d_inspector(&mut self, ui: &mut egui::Ui) {
+        section_heading(ui, "Slice surfaces");
+        ui.label(
+            RichText::new("Enable the planes you want to see, then drag their positions.")
+                .small()
+                .color(MUTED),
+        );
+        let bounds = self
+            .scene3d
+            .lock()
+            .unwrap()
+            .data
+            .as_ref()
+            .map(|data| data.header.bounds);
+        let mut reload = false;
+        for (index, label) in ["X", "Y", "Z"].into_iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut self.scene.view3d.slice_enabled[index], label)
+                    .changed()
+                {
+                    reload = true;
+                }
+                if let Some(bounds) = bounds {
+                    let low = bounds[index * 2];
+                    let high = bounds[index * 2 + 1];
+                    let mut actual = low
+                        + self.scene.view3d.slice_fractions[index].clamp(0.0, 1.0) * (high - low);
+                    let response = ui.add(
+                        egui::Slider::new(&mut actual, low..=high)
+                            .show_value(true)
+                            .custom_formatter(|value, _| format!("{value:.3}")),
+                    );
+                    if response.changed() {
+                        self.scene.view3d.slice_auto_origin[index] = false;
+                        self.scene.view3d.slice_fractions[index] =
+                            ((actual - low) / (high - low).max(1.0e-20)).clamp(0.0, 1.0);
+                        self.slice_changed_at = Some(Instant::now());
+                        reload |= response.drag_stopped();
+                    }
+                } else {
+                    let response = ui.add(
+                        egui::Slider::new(&mut self.scene.view3d.slice_fractions[index], 0.0..=1.0)
+                            .show_value(false),
+                    );
+                    if response.changed() {
+                        self.scene.view3d.slice_auto_origin[index] = false;
+                        self.slice_changed_at = Some(Instant::now());
+                        reload |= response.drag_stopped();
+                    }
+                }
+            });
+        }
+        let has_applied_isosurface = !self
+            .scene
+            .isosurfaces_for(Some(self.current_3d_section()))
+            .is_empty();
+        if !self
+            .scene
+            .view3d
+            .slice_enabled
+            .into_iter()
+            .any(|enabled| enabled)
+            && !has_applied_isosurface
+        {
+            ui.colored_label(
+                Color32::from_rgb(241, 126, 126),
+                "Enable a plane or apply an isosurface.",
+            );
+        }
+        if reload
+            && (self
+                .scene
+                .view3d
+                .slice_enabled
+                .into_iter()
+                .any(|enabled| enabled)
+                || has_applied_isosurface)
+            && let Some(variable) = self.selected_variable.clone()
+        {
+            self.slice_changed_at = None;
+            self.request_selected_plot(variable);
+        }
+
+        ui.add_space(14.0);
+        section_heading(ui, "Camera");
+        let mut scene = self.scene3d.lock().unwrap();
+        let mut camera_changed = false;
+        ui.add_enabled_ui(bounds.is_some(), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Isometric").clicked() {
+                    scene.camera.preset_isometric();
+                    camera_changed = true;
+                }
+                if ui.button("View X").clicked() {
+                    scene.camera.preset_x();
+                    camera_changed = true;
+                }
+                if ui.button("View Y").clicked() {
+                    scene.camera.preset_y();
+                    camera_changed = true;
+                }
+                if ui.button("View Z").clicked() {
+                    scene.camera.preset_z();
+                    camera_changed = true;
+                }
+                if ui.button("Reset and fit").clicked() {
+                    scene.camera.preset_isometric();
+                    scene.fit();
+                    camera_changed = true;
+                }
+            });
+            if let Some(bounds) = bounds {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Zoom out").clicked() {
+                        scene.camera.zoom_by_factor(1.25, bounds);
+                        camera_changed = true;
+                    }
+                    if ui.button("Zoom in").clicked() {
+                        scene.camera.zoom_by_factor(0.8, bounds);
+                        camera_changed = true;
+                    }
+                    if ui.button("Fit all").clicked() {
+                        scene.fit();
+                        camera_changed = true;
+                    }
+                });
+                ui.label(RichText::new("Move view target").small().color(MUTED));
+                ui.horizontal_wrapped(|ui| {
+                    for (label, x, y) in [
+                        ("Left", -40.0, 0.0),
+                        ("Right", 40.0, 0.0),
+                        ("Up", 0.0, -40.0),
+                        ("Down", 0.0, 40.0),
+                    ] {
+                        if ui.small_button(label).clicked() {
+                            scene.camera.pan(x, y);
+                            camera_changed = true;
+                        }
+                    }
+                });
+                ui.label(
+                    RichText::new("Exact target coordinates")
+                        .small()
+                        .color(MUTED),
+                );
+                ui.horizontal(|ui| {
+                    for (axis, coordinate) in
+                        ["x", "y", "z"].into_iter().zip(&mut scene.camera.target)
+                    {
+                        if ui
+                            .add(
+                                egui::DragValue::new(coordinate)
+                                    .speed(0.1)
+                                    .prefix(format!("{axis} ")),
+                            )
+                            .changed()
+                        {
+                            camera_changed = true;
+                        }
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Projection");
+                camera_changed |= ui
+                    .selectable_value(
+                        &mut scene.camera.projection,
+                        Projection3d::Perspective,
+                        "Perspective",
+                    )
+                    .changed();
+                camera_changed |= ui
+                    .selectable_value(
+                        &mut scene.camera.projection,
+                        Projection3d::Orthographic,
+                        "Orthographic",
+                    )
+                    .changed();
+            });
+        });
+        ui.small(
+            RichText::new(
+                "Left drag rotates. Shift+left, right, or middle drag pans. Wheel or pinch zooms.",
+            )
+            .color(MUTED),
+        );
+        if camera_changed && bounds.is_some() {
+            self.scene.view3d.camera = Some(scene.camera);
+        }
+
+        ui.add_space(14.0);
+        section_heading(ui, "Scene");
+        if ui
+            .add(
+                egui::Slider::new(&mut self.scene.view3d.surface_opacity, 0.05..=1.0)
+                    .text("Surface opacity"),
+            )
+            .changed()
+        {
+            scene.display.opacity = self.scene.view3d.surface_opacity;
+        }
+        if ui
+            .checkbox(&mut self.scene.view3d.show_axes, "Axes")
+            .changed()
+        {
+            scene.display.show_axes = self.scene.view3d.show_axes;
+        }
+        if ui
+            .checkbox(&mut self.scene.view3d.show_box, "Domain box")
+            .changed()
+        {
+            scene.display.show_box = self.scene.view3d.show_box;
+        }
+        let mut retrace_fieldlines = false;
+        if ui
+            .checkbox(
+                &mut self.scene.view3d.show_reference_sphere,
+                "Planet / inner boundary",
+            )
+            .changed()
+        {
+            scene.display.show_reference_sphere = self.scene.view3d.show_reference_sphere;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Planet radius");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.scene.view3d.reference_sphere_radius)
+                        .range(0.1..=20.0)
+                        .speed(0.05)
+                        .suffix(" Re"),
+                )
+                .changed()
+            {
+                scene.display.reference_sphere_radius = self.scene.view3d.reference_sphere_radius;
+                retrace_fieldlines = true;
+            }
+        });
+        ui.small(
+            RichText::new("Centered at (0, 0, 0); the default radius is 2.5 Re.").color(MUTED),
+        );
+        drop(scene);
+        if retrace_fieldlines {
+            self.request_fieldlines3d_for_display();
+        }
+    }
+
     fn appearance_inspector(&mut self, ui: &mut egui::Ui) {
         let variable = self.selected_variable.clone();
         let mut override_enabled = variable
@@ -1535,7 +3078,10 @@ impl ViewerApp {
 
         let before = self.scene.appearance_for(variable.as_deref());
         let mut edited = before.clone();
-        let effective_limits = self.plot.lock().unwrap().display.limits;
+        let effective_limits = match self.view_mode {
+            ViewMode::TwoD => self.plot.lock().unwrap().display.limits,
+            ViewMode::ThreeD => self.scene3d.lock().unwrap().display.limits,
+        };
 
         ui.add_space(10.0);
         section_heading(ui, "Color mapping");
@@ -1624,6 +3170,59 @@ impl ViewerApp {
         ui.collapsing("Available title tokens", |ui| {
             ui.small("{variable}  {source}  {unit}  {section}  {time}  {dump}  {zone}  {file}  {run}  {dataset_title}");
         });
+
+        if self.view_mode == ViewMode::TwoD {
+            ui.add_space(14.0);
+            section_heading(ui, "Planet overlays");
+            let before_view = self.scene.view2d.clone();
+            let mut view = before_view.clone();
+            ui.checkbox(
+                &mut view.show_inner_boundary,
+                "Show gray inner-boundary disk",
+            );
+            if view.show_inner_boundary {
+                ui.add(
+                    egui::DragValue::new(&mut view.inner_boundary_radius)
+                        .range(0.1..=20.0)
+                        .speed(0.05)
+                        .prefix("Boundary radius ")
+                        .suffix(" Re"),
+                );
+            }
+            ui.checkbox(&mut view.show_earth, "Show day/night Earth disk");
+            if view.show_earth {
+                ui.add(
+                    egui::DragValue::new(&mut view.earth_radius)
+                        .range(0.1..=10.0)
+                        .speed(0.05)
+                        .prefix("Earth radius ")
+                        .suffix(" Re"),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("White dayside faces");
+                    ui.selectable_value(
+                        &mut view.dayside_direction,
+                        DaysideDirection2d::PositiveX,
+                        "+X",
+                    );
+                    ui.selectable_value(
+                        &mut view.dayside_direction,
+                        DaysideDirection2d::NegativeX,
+                        "−X",
+                    );
+                });
+            }
+            ui.small(
+                RichText::new(
+                    "Both are centered at (0, 0). +X is the standard sunward convention; use −X only for a reversed display convention.",
+                )
+                .color(MUTED),
+            );
+            if view != before_view {
+                self.editor.checkpoint(&self.scene);
+                self.scene.view2d = view;
+            }
+        }
 
         if edited != before {
             self.editor.checkpoint(&self.scene);
@@ -1902,13 +3501,6 @@ impl ViewerApp {
                         edited.enabled = true;
                         edited.horizontal_component = Some(horizontal);
                         edited.vertical_component = Some(vertical);
-                        if edited.seeds.is_empty() {
-                            edited.seeds = seed_grid(
-                                data.header.bounds,
-                                edited.seed_columns,
-                                edited.seed_rows,
-                            );
-                        }
                     }
                     if magnetic.is_none() {
                         ui.label(
@@ -1960,10 +3552,6 @@ impl ViewerApp {
                 .clicked()
             {
                 edited.enabled = true;
-                if edited.seeds.is_empty() {
-                    edited.seeds =
-                        seed_grid(data.header.bounds, edited.seed_columns, edited.seed_rows);
-                }
             }
         } else {
             ui.add_space(8.0);
@@ -2026,7 +3614,15 @@ impl ViewerApp {
             }
 
             ui.add_space(12.0);
-            section_heading(ui, "Seeds");
+            latitude_seed_controls(ui, &mut edited.latitude_seeds, true);
+
+            ui.add_space(12.0);
+            section_heading(ui, "Additional seed points");
+            ui.label(
+                RichText::new("Add individual points or a regular grid elsewhere in the plot.")
+                    .small()
+                    .color(MUTED),
+            );
             ui.horizontal(|ui| {
                 let can_place = edited.horizontal_component.is_some()
                     && edited.vertical_component.is_some()
@@ -2070,12 +3666,51 @@ impl ViewerApp {
                         .prefix("rows "),
                 );
             });
-            if ui.button("Replace with uniform grid").clicked() {
-                edited.seeds = seed_grid(data.header.bounds, edited.seed_columns, edited.seed_rows);
+            let mut use_region = edited.seed_region.is_some();
+            if ui
+                .checkbox(&mut use_region, "Limit grid to a custom region")
+                .changed()
+            {
+                edited.seed_region = use_region.then_some(data.header.bounds);
             }
-            if edited.seeds.is_empty() {
+            if let Some(region) = &mut edited.seed_region {
+                ui.horizontal(|ui| {
+                    ui.label(&data.header.x_label);
+                    ui.add(
+                        egui::DragValue::new(&mut region[0])
+                            .speed(0.1)
+                            .prefix("min "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut region[1])
+                            .speed(0.1)
+                            .prefix("max "),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label(&data.header.y_label);
+                    ui.add(
+                        egui::DragValue::new(&mut region[2])
+                            .speed(0.1)
+                            .prefix("min "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut region[3])
+                            .speed(0.1)
+                            .prefix("max "),
+                    );
+                });
+            }
+            if ui.button("Replace custom seeds with this grid").clicked() {
+                edited.seeds = seed_grid(
+                    edited.seed_region.unwrap_or(data.header.bounds),
+                    edited.seed_columns,
+                    edited.seed_rows,
+                );
+            }
+            if edited.seeds.is_empty() && !edited.latitude_seeds.enabled {
                 ui.label(
-                    RichText::new("Place seeds on the plot or generate a uniform grid.")
+                    RichText::new("Enable planetary footpoints, place seeds, or generate a grid.")
                         .color(MUTED),
                 );
             } else {
@@ -2201,6 +3836,7 @@ impl ViewerApp {
                 || edited.horizontal_component != before.horizontal_component
                 || edited.vertical_component != before.vertical_component;
             let reintegrate = edited.seeds != before.seeds
+                || edited.latitude_seeds != before.latitude_seeds
                 || edited.step_fraction != before.step_fraction
                 || edited.max_steps != before.max_steps
                 || edited.direction != before.direction;
@@ -2222,6 +3858,354 @@ impl ViewerApp {
                 self.update_streamline_style();
             }
         }
+    }
+
+    fn fieldline3d_inspector(&mut self, ui: &mut egui::Ui) {
+        let data = self.scene3d.lock().unwrap().data.clone();
+        let Some(data) = data else {
+            section_heading(ui, "3D field lines");
+            ui.label(RichText::new("Load a 3D file to configure field lines.").color(MUTED));
+            return;
+        };
+        let section = data.header.section.clone();
+        let before = self.scene.fieldlines3d_for(Some(&section));
+        let mut edited = before.clone();
+        let variables: Vec<_> = self
+            .displayed_info
+            .as_ref()
+            .or(self.info.as_ref())
+            .map(|info| {
+                info.variables
+                    .iter()
+                    .filter(|variable| {
+                        !is_coordinate(&variable.source) && !is_coordinate(&variable.canonical)
+                    })
+                    .map(|variable| {
+                        (
+                            variable.canonical.clone(),
+                            if variable.canonical == variable.source {
+                                variable.source.clone()
+                            } else {
+                                format!("{} · {}", variable.canonical, variable.source)
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let magnetic = self.magnetic_components3d();
+
+        section_heading(ui, "Optional 3D field lines");
+        ui.label(
+            RichText::new("Field lines are never added automatically. Choose a vector field when you want this overlay.")
+                .small()
+                .color(MUTED),
+        );
+        if !edited.enabled {
+            ui.add_space(8.0);
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(18, 29, 41))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(42, 65, 84)))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("No 3D field lines are being drawn").strong());
+                    ui.label(
+                        RichText::new("The default seeds are invisible planetary footpoints distributed by latitude and longitude.")
+                            .small()
+                            .color(MUTED),
+                    );
+                    ui.add_space(8.0);
+                    if ui
+                        .add_enabled(
+                            magnetic.is_some(),
+                            egui::Button::new(RichText::new("Add magnetic field lines").strong())
+                                .fill(Color32::from_rgb(34, 91, 137))
+                                .min_size(egui::vec2(ui.available_width(), 36.0)),
+                        )
+                        .on_hover_text("Trace magnetic_field.x, .y, and .z")
+                        .clicked()
+                        && let Some(components) = magnetic.clone()
+                    {
+                        edited.components = components.map(Some);
+                        edited.enabled = true;
+                    }
+                    if magnetic.is_none() {
+                        ui.label(
+                            RichText::new("Magnetic-field components were not detected; choose a custom vector field below.")
+                                .small()
+                                .color(MUTED),
+                        );
+                    }
+                });
+            ui.add_space(14.0);
+            section_heading(ui, "Or add a custom vector field");
+            for (index, label) in ["X component", "Y component", "Z component"]
+                .into_iter()
+                .enumerate()
+            {
+                variable_combo(ui, label, &mut edited.components[index], &variables);
+            }
+            let custom_is_valid = components_are_distinct(&edited.components);
+            if ui
+                .add_enabled(
+                    custom_is_valid,
+                    egui::Button::new("Add custom 3D field lines")
+                        .min_size(egui::vec2(ui.available_width(), 32.0)),
+                )
+                .clicked()
+            {
+                edited.enabled = true;
+            }
+        } else {
+            ui.add_space(8.0);
+            egui::Frame::group(ui.style())
+                .fill(Color32::from_rgb(17, 38, 47))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(47, 101, 112)))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("3D field-line overlay is on")
+                                .strong()
+                                .color(ACCENT),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Hide").clicked() {
+                                edited.enabled = false;
+                            }
+                        });
+                    });
+                });
+
+            ui.add_space(12.0);
+            section_heading(ui, "Vector components");
+            if ui
+                .add_enabled(
+                    magnetic.is_some(),
+                    egui::Button::new("Use magnetic field Bx / By / Bz"),
+                )
+                .clicked()
+                && let Some(components) = magnetic
+            {
+                edited.components = components.map(Some);
+            }
+            for (index, label) in ["X component", "Y component", "Z component"]
+                .into_iter()
+                .enumerate()
+            {
+                variable_combo(ui, label, &mut edited.components[index], &variables);
+            }
+            if !components_are_distinct(&edited.components) {
+                ui.colored_label(
+                    Color32::from_rgb(241, 126, 126),
+                    "Choose three different vector components.",
+                );
+            }
+
+            ui.add_space(14.0);
+            latitude_seed_controls(ui, &mut edited.latitude_seeds, true);
+
+            ui.add_space(14.0);
+            section_heading(ui, "Additional seed region");
+            ui.label(
+                RichText::new("Optionally trace a regular 3D grid in another part of the domain.")
+                    .small()
+                    .color(MUTED),
+            );
+            let mut use_region = edited.seed_region.is_some();
+            if ui
+                .checkbox(&mut use_region, "Include a custom region")
+                .changed()
+            {
+                edited.seed_region = use_region.then_some(data.header.bounds);
+            }
+            if let Some(region) = &mut edited.seed_region {
+                for (label, low, high) in [("X", 0, 1), ("Y", 2, 3), ("Z", 4, 5)] {
+                    ui.horizontal(|ui| {
+                        ui.label(label);
+                        ui.add(
+                            egui::DragValue::new(&mut region[low])
+                                .speed(0.1)
+                                .prefix("min "),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut region[high])
+                                .speed(0.1)
+                                .prefix("max "),
+                        );
+                    });
+                }
+                ui.horizontal(|ui| {
+                    for (axis, count) in ["X", "Y", "Z"].into_iter().zip(&mut edited.region_counts)
+                    {
+                        ui.add(
+                            egui::DragValue::new(count)
+                                .range(1..=12)
+                                .prefix(format!("{axis} ")),
+                        );
+                    }
+                });
+                let count = edited
+                    .region_counts
+                    .iter()
+                    .map(|value| usize::from(*value))
+                    .product::<usize>();
+                ui.small(
+                    RichText::new(format!("{count} generated region seeds (not displayed)"))
+                        .color(MUTED),
+                );
+            }
+
+            ui.add_space(10.0);
+            section_heading(ui, "Individual seed points");
+            ui.horizontal(|ui| {
+                if ui.button("Add point").clicked() {
+                    edited.custom_seeds.push(DataPoint3::new(3.0, 0.0, 0.0));
+                }
+                if ui
+                    .add_enabled(!edited.custom_seeds.is_empty(), egui::Button::new("Clear"))
+                    .clicked()
+                {
+                    edited.custom_seeds.clear();
+                }
+                ui.small(
+                    RichText::new(format!("{} custom", edited.custom_seeds.len())).color(MUTED),
+                );
+            });
+            let mut remove = None;
+            for (index, seed) in edited.custom_seeds.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.small(format!("{}", index + 1));
+                    ui.add(egui::DragValue::new(&mut seed.x).speed(0.05).prefix("x "));
+                    ui.add(egui::DragValue::new(&mut seed.y).speed(0.05).prefix("y "));
+                    ui.add(egui::DragValue::new(&mut seed.z).speed(0.05).prefix("z "));
+                    if ui.small_button("×").clicked() {
+                        remove = Some(index);
+                    }
+                });
+            }
+            if let Some(index) = remove {
+                edited.custom_seeds.remove(index);
+            }
+
+            ui.add_space(14.0);
+            section_heading(ui, "Integration");
+            ui.add(
+                egui::DragValue::new(&mut edited.step_size)
+                    .range(0.005..=5.0)
+                    .speed(0.01)
+                    .suffix(" Re / step"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut edited.max_steps)
+                    .range(10..=20_000)
+                    .speed(100)
+                    .suffix(" max steps"),
+            );
+            ui.add(
+                egui::DragValue::new(&mut edited.max_length)
+                    .range(1.0..=5_000.0)
+                    .speed(1.0)
+                    .suffix(" Re max length"),
+            );
+
+            ui.add_space(14.0);
+            section_heading(ui, "Line style");
+            let mut color = edited.color.to_egui();
+            ui.horizontal(|ui| {
+                ui.label("Color");
+                if ui.color_edit_button_srgba(&mut color).changed() {
+                    edited.color = RgbaColor::from_egui(color);
+                }
+            });
+            ui.add(
+                egui::Slider::new(&mut edited.width, 0.25..=8.0)
+                    .text("Width")
+                    .suffix(" px"),
+            );
+            ui.checkbox(&mut edited.arrows, "Show direction arrows");
+            if edited.arrows {
+                ui.add(
+                    egui::Slider::new(&mut edited.arrow_size, 3.0..=20.0)
+                        .text("Arrow size")
+                        .suffix(" px"),
+                );
+            }
+
+            if self.fieldlines3d_loading {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new(if self.fieldlines3d.is_some() {
+                            "Tracing next frame… previous lines remain visible"
+                        } else {
+                            "Tracing 3D field lines…"
+                        })
+                        .color(MUTED),
+                    );
+                });
+            } else if let Some(error) = &self.fieldlines3d_error {
+                ui.add_space(8.0);
+                ui.colored_label(Color32::from_rgb(241, 126, 126), error);
+            } else if let Some(lines) = &self.fieldlines3d {
+                ui.add_space(8.0);
+                ui.small(
+                    RichText::new(format!(
+                        "{} field lines · {} points",
+                        lines.header.line_count, lines.header.point_count
+                    ))
+                    .color(MUTED),
+                );
+            }
+        }
+
+        if edited != before {
+            let retrace = edited.enabled != before.enabled
+                || edited.components != before.components
+                || edited.latitude_seeds != before.latitude_seeds
+                || edited.custom_seeds != before.custom_seeds
+                || edited.seed_region != before.seed_region
+                || edited.region_counts != before.region_counts
+                || edited.step_size != before.step_size
+                || edited.max_steps != before.max_steps
+                || edited.max_length != before.max_length;
+            self.editor.checkpoint(&self.scene);
+            self.scene
+                .set_fieldlines3d_for(Some(&section), edited.clone());
+            if !edited.enabled {
+                self.loader.cancel_auxiliary();
+                self.active_fieldlines3d_request = None;
+                self.fieldlines3d_loading = false;
+                self.fieldlines3d = None;
+                self.fieldlines3d_error = None;
+            } else if retrace {
+                self.request_fieldlines3d_for_display();
+            }
+        }
+    }
+
+    fn magnetic_components3d(&self) -> Option<[String; 3]> {
+        let info = self.displayed_info.as_ref().or(self.info.as_ref())?;
+        let component = |axis: char| {
+            let canonical = format!("magnetic_field.{axis}");
+            info.variables
+                .iter()
+                .find(|variable| variable.canonical.eq_ignore_ascii_case(&canonical))
+                .map(|variable| variable.canonical.clone())
+                .or_else(|| {
+                    info.variables
+                        .iter()
+                        .find(|variable| {
+                            let source = variable.source.to_ascii_lowercase().replace(' ', "");
+                            source.starts_with(&format!("b_{axis}"))
+                                || source.starts_with(&format!("b{axis}["))
+                        })
+                        .map(|variable| variable.canonical.clone())
+                })
+        };
+        Some([component('x')?, component('y')?, component('z')?])
     }
 
     fn magnetic_components(&self) -> Option<(String, String)> {
@@ -2268,6 +4252,19 @@ impl ViewerApp {
         } else {
             ui.label(RichText::new("Select a file to inspect its metadata.").color(MUTED));
         }
+        if self.view_mode == ViewMode::ThreeD {
+            let shared = self.scene3d.lock().unwrap();
+            if let Some(data) = &shared.data {
+                ui.add_space(14.0);
+                section_heading(ui, "Loaded 3D scene");
+                metadata_row(ui, "Variable", &data.header.canonical_name);
+                metadata_row(ui, "Source", &data.header.variable);
+                metadata_row(ui, "Slice planes", &data.header.layers.len().to_string());
+                metadata_row(ui, "Triangles", &data.header.triangle_count.to_string());
+                metadata_row(ui, "Vertices", &data.header.vertex_count.to_string());
+            }
+            return;
+        }
         let shared = self.plot.lock().unwrap();
         if let Some(data) = &shared.data {
             ui.add_space(14.0);
@@ -2282,6 +4279,10 @@ impl ViewerApp {
     }
 
     fn plot_panel(&mut self, root: &mut egui::Ui) {
+        if self.view_mode == ViewMode::ThreeD {
+            self.plot_panel_3d(root);
+            return;
+        }
         let can_place_streamline_seed = self
             .plot
             .lock()
@@ -2330,6 +4331,7 @@ impl ViewerApp {
                                     self.editor.cancel_drawing();
                                     self.editor.tool = tool;
                                     self.placing_streamline_seed = false;
+                                    self.probe_mode = false;
                                 }
                             }
                             ui.separator();
@@ -2343,7 +4345,21 @@ impl ViewerApp {
                                 self.editor.cancel_drawing();
                                 self.editor.tool = DrawingTool::Select;
                                 self.placing_streamline_seed = !self.placing_streamline_seed;
+                                self.probe_mode = false;
                                 self.inspector_tab = InspectorTab::FieldLines;
+                            }
+                            if toolbar_icon_button(
+                                ui,
+                                ToolbarIcon::Probe,
+                                self.probe_mode,
+                                self.probe_index.is_some(),
+                                "Probe and pin interpolated values  P",
+                            ) {
+                                self.editor.cancel_drawing();
+                                self.editor.tool = DrawingTool::Select;
+                                self.placing_streamline_seed = false;
+                                self.probe_mode = !self.probe_mode;
+                                self.inspector_tab = InspectorTab::Data;
                             }
                             ui.separator();
                             if toolbar_icon_button(
@@ -2407,8 +4423,8 @@ impl ViewerApp {
                 };
                 if let Some(data) = data {
                     let chart_outer = egui::Rect::from_min_max(
-                        export_rect.min + egui::vec2(64.0, 62.0),
-                        export_rect.max - egui::vec2(112.0, 52.0),
+                        export_rect.min + egui::vec2(72.0, 72.0),
+                        export_rect.max - egui::vec2(120.0, 58.0),
                     );
                     let plot_rect = fit_plot_rect(chart_outer, display.view_bounds);
                     let response = ui.interact(
@@ -2428,6 +4444,14 @@ impl ViewerApp {
                     if let Some(overlay) = &self.streamline_overlay {
                         paint_streamlines(ui, plot_rect, display.view_bounds, overlay);
                     }
+                    paint_reference_bodies_2d(
+                        ui,
+                        plot_rect,
+                        display.view_bounds,
+                        &data.header.x_label,
+                        &data.header.y_label,
+                        &self.scene.view2d,
+                    );
 
                     let (section, variable, relative_path) = self.scope_values();
                     let scope = ScopeContext {
@@ -2470,7 +4494,24 @@ impl ViewerApp {
                         .map(|pointer| {
                             streamline_seed_point(pointer, plot_rect, display.view_bounds)
                         });
-                    let consumed = if self.placing_streamline_seed {
+                    let probe_hit = response
+                        .hover_pos()
+                        .and_then(|pointer| {
+                            let point = streamline_seed_point(pointer, plot_rect, display.view_bounds);
+                            self.probe_index
+                                .as_ref()
+                                .and_then(|index| index.query_2d([point.x as f32, point.y as f32]))
+                        });
+                    self.hover_probe = probe_hit.clone();
+                    let probe_pinned = self.probe_mode
+                        && response.clicked_by(egui::PointerButton::Primary)
+                        && probe_hit.is_some();
+                    if probe_pinned && let Some(hit) = probe_hit.clone() {
+                        self.pin_probe(hit, ProbeDimension::TwoD);
+                    }
+                    let consumed = if self.probe_mode {
+                        true
+                    } else if self.placing_streamline_seed {
                         new_seed.is_some()
                     } else {
                         self.editor.interact(
@@ -2515,6 +4556,19 @@ impl ViewerApp {
                         &scope,
                         true,
                     );
+                    paint_probe_measurements_2d(
+                        ui,
+                        plot_rect,
+                        display.view_bounds,
+                        &self.scene.measurements,
+                        relative_path.as_deref().unwrap_or_default(),
+                        variable.as_deref().unwrap_or_default(),
+                    );
+                    if let (Some(pointer), Some(hit)) = (response.hover_pos(), probe_hit.as_ref()) {
+                        paint_probe_readout(ui, plot_rect, pointer, hit);
+                    } else if self.probe_indexing && response.hovered() {
+                        paint_probe_status(ui, plot_rect, "Probe indexing…");
+                    }
                     let appearance = self
                         .scene
                         .appearance_for(self.displayed_variable.as_deref());
@@ -2536,6 +4590,365 @@ impl ViewerApp {
                         muted,
                     );
                 }
+                ui.add_space(7.0);
+                self.timeline_bar(ui);
+            });
+    }
+
+    fn plot_panel_3d(&mut self, root: &mut egui::Ui) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(DEEP_BG))
+            .show(root, |ui| {
+                egui::Frame::new()
+                    .fill(PANEL_BG)
+                    .corner_radius(6)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(31, 43, 57)))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("3D VIEW").size(9.5).strong().color(MUTED));
+                            if toolbar_icon_button(
+                                ui,
+                                ToolbarIcon::Probe,
+                                self.probe_mode,
+                                self.probe_index.is_some(),
+                                "Probe and pin the nearest visible surface  P",
+                            ) {
+                                self.probe_mode = !self.probe_mode;
+                                self.inspector_tab = InspectorTab::Data;
+                            }
+                            ui.separator();
+                            let mut scene = self.scene3d.lock().unwrap();
+                            let bounds = scene
+                                .data
+                                .as_ref()
+                                .map(|data| data.header.active_bounds());
+                            let enabled = bounds.is_some();
+                            let mut camera_changed = false;
+                            for (label, tooltip, preset) in [
+                                ("Iso", "Isometric view", 0),
+                                ("X", "Look along X", 1),
+                                ("Y", "Look along Y", 2),
+                                ("Z", "Look along Z", 3),
+                            ] {
+                                if ui
+                                    .add_enabled(enabled, egui::Button::new(label))
+                                    .on_hover_text(tooltip)
+                                    .clicked()
+                                {
+                                    match preset {
+                                        0 => scene.camera.preset_isometric(),
+                                        1 => scene.camera.preset_x(),
+                                        2 => scene.camera.preset_y(),
+                                        _ => scene.camera.preset_z(),
+                                    }
+                                    camera_changed = true;
+                                }
+                            }
+                            if ui
+                                .add_enabled(enabled, egui::Button::new("Fit all"))
+                                .on_hover_text("Fit the complete domain  F")
+                                .clicked()
+                            {
+                                scene.fit();
+                                camera_changed = true;
+                            }
+                            if ui
+                                .add_enabled(enabled, egui::Button::new("Reset view"))
+                                .on_hover_text("Restore the isometric view and fit the complete domain")
+                                .clicked()
+                            {
+                                scene.camera.preset_isometric();
+                                scene.fit();
+                                camera_changed = true;
+                            }
+                            ui.separator();
+                            if ui
+                                .add_enabled(enabled, egui::Button::new("Zoom -"))
+                                .on_hover_text("Zoom out")
+                                .clicked()
+                                && let Some(bounds) = bounds
+                            {
+                                scene.camera.zoom_by_factor(1.25, bounds);
+                                camera_changed = true;
+                            }
+                            if ui
+                                .add_enabled(enabled, egui::Button::new("Zoom +"))
+                                .on_hover_text("Zoom in")
+                                .clicked()
+                                && let Some(bounds) = bounds
+                            {
+                                scene.camera.zoom_by_factor(0.8, bounds);
+                                camera_changed = true;
+                            }
+                            ui.separator();
+                            let perspective = scene.camera.projection == Projection3d::Perspective;
+                            if ui
+                                .add_enabled(
+                                    enabled,
+                                    egui::Button::selectable(perspective, "Perspective"),
+                                )
+                                .on_hover_text("Toggle perspective / orthographic projection")
+                                .clicked()
+                            {
+                                scene.camera.projection = if perspective {
+                                    Projection3d::Orthographic
+                                } else {
+                                    Projection3d::Perspective
+                                };
+                                camera_changed = true;
+                            }
+                            if camera_changed {
+                                self.scene.view3d.camera = Some(scene.camera);
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(
+                                            "Drag: rotate  ·  Shift/right drag: pan  ·  Wheel/pinch: zoom",
+                                        )
+                                        .small()
+                                        .color(MUTED),
+                                    );
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(7.0);
+                let available = ui.available_size();
+                let canvas_size = egui::vec2(available.x, (available.y - 57.0).max(120.0));
+                let (canvas_rect, response) =
+                    ui.allocate_exact_size(canvas_size, Sense::click_and_drag());
+                self.last_export_rect = Some(canvas_rect);
+                ui.painter().rect_filled(canvas_rect, 6.0, DEEP_BG);
+                ui.painter().rect_stroke(
+                    canvas_rect,
+                    6.0,
+                    Stroke::new(1.0, Color32::from_rgb(37, 50, 65)),
+                    StrokeKind::Inside,
+                );
+
+                let data = self.scene3d.lock().unwrap().data.clone();
+                if let Some(data) = data {
+                    let scene_rect = egui::Rect::from_min_max(
+                        canvas_rect.min + egui::vec2(18.0, 66.0),
+                        canvas_rect.max - egui::vec2(112.0, 24.0),
+                    );
+                    ui.painter().add(Scene3dCallback::paint_callback(
+                        scene_rect,
+                        self.scene3d.clone(),
+                    ));
+                    let fieldline_settings =
+                        self.scene.fieldlines3d_for(Some(&data.header.section));
+                    if let Some(lines) = &self.fieldlines3d {
+                        paint_fieldlines3d(
+                            ui,
+                            scene_rect,
+                            &self.scene3d,
+                            lines,
+                            &fieldline_settings,
+                        );
+                    }
+                    paint_scene_overlays(ui, scene_rect, &self.scene3d);
+
+                    let scene_response = ui.interact(
+                        scene_rect,
+                        ui.id().with("scene3d_interaction"),
+                        Sense::click_and_drag(),
+                    );
+                    let mut changed = false;
+                    {
+                        let mut scene = self.scene3d.lock().unwrap();
+                        let delta = ui.input(|input| input.pointer.delta());
+                        if scene_response.dragged_by(egui::PointerButton::Primary) {
+                            let pan = ui.input(|input| input.modifiers.shift);
+                            if pan {
+                                scene.camera.pan(delta.x, delta.y);
+                            } else {
+                                scene.camera.orbit(delta.x, delta.y);
+                            }
+                            changed = true;
+                        }
+                        if scene_response.dragged_by(egui::PointerButton::Secondary)
+                            || scene_response.dragged_by(egui::PointerButton::Middle)
+                        {
+                            scene.camera.pan(delta.x, delta.y);
+                            changed = true;
+                        }
+                        if scene_response.double_clicked() {
+                            scene.fit();
+                            changed = true;
+                        }
+                        if scene_response.hovered() {
+                            let (scroll, pinch) = ui.input(|input| {
+                                (input.smooth_scroll_delta.y, input.zoom_delta())
+                            });
+                            if scroll != 0.0 {
+                                scene.camera.zoom(scroll, data.header.active_bounds());
+                                changed = true;
+                            }
+                            if (pinch - 1.0).abs() > 1.0e-3 {
+                                scene
+                                    .camera
+                                    .zoom_by_factor(1.0 / pinch, data.header.active_bounds());
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            self.scene.view3d.camera = Some(scene.camera);
+                        }
+                    }
+
+                    let probe_hit = scene_response.hover_pos().and_then(|pointer| {
+                        let camera = self.scene3d.lock().unwrap().camera;
+                        let visible_layers = self
+                            .scene
+                            .isosurfaces_for(Some(&data.header.section))
+                            .iter()
+                            .filter(|layer| layer.visible)
+                            .map(|layer| layer.id)
+                            .collect::<Vec<_>>();
+                        let ray = camera_ray(camera, scene_rect, pointer);
+                        self.probe_index.as_ref().and_then(|index| {
+                            index.query_3d(ray, |layer_id| {
+                                layer_id.is_none_or(|id| visible_layers.contains(&id))
+                            })
+                        })
+                    });
+                    self.hover_probe = probe_hit.clone();
+                    if self.probe_mode
+                        && scene_response.clicked_by(egui::PointerButton::Primary)
+                        && let Some(hit) = probe_hit.clone()
+                    {
+                        self.pin_probe(hit, ProbeDimension::ThreeD);
+                    }
+                    let (_, scope_variable, relative_path) = self.scope_values();
+                    paint_probe_measurements_3d(
+                        ui,
+                        scene_rect,
+                        &self.scene3d,
+                        &self.scene.measurements,
+                        relative_path.as_deref().unwrap_or_default(),
+                        scope_variable.as_deref().unwrap_or_default(),
+                    );
+                    if let (Some(pointer), Some(hit)) =
+                        (scene_response.hover_pos(), probe_hit.as_ref())
+                    {
+                        paint_probe_readout(ui, scene_rect, pointer, hit);
+                    } else if self.probe_indexing && scene_response.hovered() {
+                        paint_probe_status(ui, scene_rect, "Probe indexing…");
+                    }
+
+                    let appearance = self
+                        .scene
+                        .appearance_for(self.displayed_variable.as_deref());
+                    let title = self
+                        .title_with_surface(&appearance.title, &data.header)
+                        .unwrap_or_else(|_| data.header.canonical_name.clone());
+                    ui.painter().text(
+                        canvas_rect.left_top() + egui::vec2(20.0, 15.0),
+                        egui::Align2::LEFT_TOP,
+                        title,
+                        FontId::proportional(24.0),
+                        Color32::from_rgb(226, 232, 240),
+                    );
+                    ui.painter().text(
+                        canvas_rect.left_top() + egui::vec2(20.0, 45.0),
+                        egui::Align2::LEFT_TOP,
+                        format!(
+                            "{} · {} · {} rendered layer{}",
+                            data.header.variable,
+                            data.header.zone_name,
+                            data.header.layers.len(),
+                            if data.header.layers.len() == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        ),
+                        FontId::proportional(13.5),
+                        MUTED,
+                    );
+                    if let Some((colorbar_appearance, colorbar_limits, unit)) =
+                        self.active_3d_colorbar(&data)
+                    {
+                        let colorbar = colorbar_rect_3d(canvas_rect);
+                        let steps = colorbar.height().max(1.0) as usize;
+                        for index in 0..steps {
+                            let t = 1.0 - index as f32 / steps.max(1) as f32;
+                            let color = sample_appearance(&colorbar_appearance, t);
+                            let y = colorbar.top() + index as f32;
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(colorbar.left(), y),
+                                    egui::pos2(colorbar.right(), y),
+                                ],
+                                Stroke::new(1.5, color),
+                            );
+                        }
+                        ui.painter().rect_stroke(
+                            colorbar,
+                            0.0,
+                            Stroke::new(1.0, MUTED),
+                            StrokeKind::Inside,
+                        );
+                        for tick in colorbar_ticks(
+                            &colorbar_appearance.ticks,
+                            colorbar_limits,
+                            colorbar_appearance.scale,
+                        ) {
+                            if let Some(normalized) = normalized_value(
+                                tick.value,
+                                colorbar_limits,
+                                colorbar_appearance.scale,
+                            ) {
+                                let y = colorbar.bottom() - normalized * colorbar.height();
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(colorbar.right(), y),
+                                        egui::pos2(colorbar.right() + 4.0, y),
+                                    ],
+                                    Stroke::new(1.0, MUTED),
+                                );
+                                ui.painter().text(
+                                    egui::pos2(colorbar.right() + 7.0, y),
+                                    egui::Align2::LEFT_CENTER,
+                                    tick.label,
+                                    FontId::monospace(12.5),
+                                    Color32::from_rgb(226, 232, 240),
+                                );
+                            }
+                        }
+                        if !unit.is_empty() {
+                            ui.painter().text(
+                                colorbar.center_top() - egui::vec2(0.0, 8.0),
+                                egui::Align2::CENTER_BOTTOM,
+                                unit,
+                                FontId::proportional(12.5),
+                                Color32::from_rgb(226, 232, 240),
+                            );
+                        }
+                    }
+                } else {
+                    ui.painter().text(
+                        canvas_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Open a 3D BATS-R-US file and select a variable",
+                        FontId::proportional(20.0),
+                        MUTED,
+                    );
+                }
+                if self.loading {
+                    ui.painter().text(
+                        canvas_rect.left_bottom() + egui::vec2(18.0, -16.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        "Extracting 3D scene… previous frame remains visible",
+                        FontId::proportional(13.0),
+                        MUTED,
+                    );
+                }
+                let _ = response;
                 ui.add_space(7.0);
                 self.timeline_bar(ui);
             });
@@ -2575,7 +4988,11 @@ impl ViewerApp {
                             ToolbarIcon::Play
                         },
                         self.playing,
-                        timeline.len() > 1 && self.plot.lock().unwrap().data.is_some(),
+                        timeline.len() > 1
+                            && match self.view_mode {
+                                ViewMode::TwoD => self.plot.lock().unwrap().data.is_some(),
+                                ViewMode::ThreeD => self.scene3d.lock().unwrap().data.is_some(),
+                            },
                         if self.playing { "Pause" } else { "Play" },
                     ) {
                         toggle_playback = true;
@@ -2657,6 +5074,14 @@ impl ViewerApp {
     }
 
     fn preview_title(&self, config: &TitleConfig) -> Result<String, String> {
+        if self.view_mode == ViewMode::ThreeD {
+            let shared = self.scene3d.lock().unwrap();
+            let data = shared
+                .data
+                .as_ref()
+                .ok_or_else(|| "Load a variable to preview the title".to_owned())?;
+            return self.title_with_surface(config, &data.header);
+        }
         let shared = self.plot.lock().unwrap();
         let data = shared
             .data
@@ -2744,6 +5169,63 @@ impl ViewerApp {
         })
     }
 
+    fn export_frame_3d(
+        &self,
+        destination: PathBuf,
+        settings: ExportSettings,
+        pixels_per_point: f32,
+    ) -> Option<ExportFrame3d> {
+        let render_state = self.render_state.clone()?;
+        let logical_size = self.last_export_rect?.size();
+        let data = self.scene3d.lock().unwrap().data.clone()?;
+        let appearance = self
+            .scene
+            .appearance_for(self.displayed_variable.as_deref());
+        let active_colorbar = self.active_3d_colorbar(data.as_ref());
+        let title = self
+            .title_with_surface(&appearance.title, &data.header)
+            .unwrap_or_else(|_| data.header.canonical_name.clone());
+        let subtitle = format!(
+            "{} · {} · {} rendered layer{}{}",
+            data.header.variable,
+            data.header.zone_name,
+            data.header.layers.len(),
+            if data.header.layers.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            if data.header.unit.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", data.header.unit)
+            }
+        );
+        Some(ExportFrame3d {
+            render_state,
+            scene: self.scene3d.clone(),
+            appearance: active_colorbar
+                .as_ref()
+                .map_or_else(|| appearance.clone(), |active| active.0.clone()),
+            show_colorbar: active_colorbar.is_some(),
+            colorbar_limits: active_colorbar
+                .as_ref()
+                .map_or([0.0, 1.0], |active| active.1),
+            title,
+            subtitle,
+            unit: active_colorbar.map_or_else(String::new, |active| active.2),
+            fieldlines: self.fieldlines3d.clone(),
+            fieldline_settings: self.scene.fieldlines3d_for(Some(&data.header.section)),
+            measurements: self.scene.measurements.clone(),
+            scope_variable: self.displayed_variable.clone().unwrap_or_default(),
+            scope_relative_path: self.scope_values().2.unwrap_or_default(),
+            logical_size,
+            pixels_per_point,
+            settings,
+            destination,
+        })
+    }
+
     fn title_with_header(
         &self,
         config: &TitleConfig,
@@ -2773,6 +5255,44 @@ impl ViewerApp {
                 file,
                 run,
                 dataset_title: &header.title,
+            },
+        )
+    }
+
+    fn title_with_surface(
+        &self,
+        config: &TitleConfig,
+        header: &crate::protocol::Surface3dHeader,
+    ) -> Result<String, String> {
+        let file = Path::new(&header.source)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&header.source);
+        let run = self
+            .directory
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        render_title(
+            config,
+            &TitleContext {
+                variable: &header.canonical_name,
+                source: &header.variable,
+                unit: (!header.unit.is_empty()).then_some(header.unit.as_str()),
+                section: Some(&header.section),
+                time: header
+                    .time
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .map(|value| value.round() as u64),
+                dump: header
+                    .dump
+                    .filter(|value| *value >= 0)
+                    .map(|value| value as u64),
+                zone: &header.zone_name,
+                file,
+                run,
+                dataset_title: &header.dataset_title,
             },
         )
     }
@@ -2851,6 +5371,8 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = root.ctx().clone();
         self.poll_events(&context);
+        self.poll_probe_index();
+        self.slice_debounce_tick(&context);
         self.playback_tick();
         self.shortcuts(&context);
         let dropped: Vec<PathBuf> = context.input(|input| {
@@ -2899,8 +5421,11 @@ impl eframe::App for ViewerApp {
             || self.choosing_run
             || self.io_busy
             || self.streamline_loading
+            || self.fieldlines3d_loading
+            || self.probe_indexing
             || self.playing
             || self.scrub_target.is_some()
+            || self.slice_changed_at.is_some()
         {
             context.request_repaint_after(Duration::from_millis(40));
         }
@@ -2924,27 +5449,27 @@ fn configure_style(context: &egui::Context) {
     let mut style = (*context.style_of(egui::Theme::Dark)).clone();
     style.text_styles.insert(
         egui::TextStyle::Heading,
-        FontId::new(19.0, egui::FontFamily::Proportional),
+        FontId::new(22.0, egui::FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Body,
-        FontId::new(13.5, egui::FontFamily::Proportional),
+        FontId::new(15.5, egui::FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Button,
-        FontId::new(13.0, egui::FontFamily::Proportional),
+        FontId::new(14.5, egui::FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Small,
-        FontId::new(11.5, egui::FontFamily::Proportional),
+        FontId::new(13.0, egui::FontFamily::Proportional),
     );
     style.text_styles.insert(
         egui::TextStyle::Monospace,
-        FontId::new(12.0, egui::FontFamily::Monospace),
+        FontId::new(13.5, egui::FontFamily::Monospace),
     );
-    style.spacing.item_spacing = egui::vec2(9.0, 8.0);
-    style.spacing.button_padding = egui::vec2(11.0, 6.0);
-    style.spacing.interact_size = egui::vec2(40.0, 30.0);
+    style.spacing.item_spacing = egui::vec2(9.0, 9.0);
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.interact_size = egui::vec2(42.0, 32.0);
     style.spacing.indent = 20.0;
     style.spacing.slider_width = 140.0;
     style.spacing.combo_width = 130.0;
@@ -3115,6 +5640,18 @@ fn paint_toolbar_icon(
                 stroke,
             );
         }
+        ToolbarIcon::Probe => {
+            painter.circle_stroke(center, rect.width() * 0.3, stroke);
+            painter.line_segment(
+                [egui::pos2(center.x, top), egui::pos2(center.x, bottom)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(left, center.y), egui::pos2(right, center.y)],
+                stroke,
+            );
+            painter.circle_filled(center, 1.8, color);
+        }
         ToolbarIcon::Previous | ToolbarIcon::Next => {
             let next = matches!(icon, ToolbarIcon::Next);
             let direction = if next { 1.0 } else { -1.0 };
@@ -3209,14 +5746,204 @@ fn paint_toolbar_icon(
     }
 }
 
+fn paint_probe_readout(ui: &egui::Ui, clip: egui::Rect, pointer: egui::Pos2, hit: &ProbeHit) {
+    let unit = hit
+        .unit
+        .as_deref()
+        .map_or(String::new(), |unit| format!(" {unit}"));
+    let text = if hit.position[2].abs() > 1.0e-8 || hit.layer_id.is_some() {
+        format!(
+            "{}\n({:.3}, {:.3}, {:.3})\n{} = {:.6e}{}",
+            hit.layer_name,
+            hit.position[0],
+            hit.position[1],
+            hit.position[2],
+            hit.variable,
+            hit.value,
+            unit
+        )
+    } else {
+        format!(
+            "({:.3}, {:.3})\n{} = {:.6e}{}",
+            hit.position[0], hit.position[1], hit.variable, hit.value, unit
+        )
+    };
+    let size = egui::vec2(
+        (text.lines().map(str::len).max().unwrap_or(1) as f32 * 7.2 + 16.0).min(300.0),
+        text.lines().count() as f32 * 17.0 + 12.0,
+    );
+    let mut position = pointer + egui::vec2(14.0, 14.0);
+    if position.x + size.x > clip.right() {
+        position.x = pointer.x - size.x - 14.0;
+    }
+    if position.y + size.y > clip.bottom() {
+        position.y = pointer.y - size.y - 14.0;
+    }
+    let rect = egui::Rect::from_min_size(position, size);
+    let painter = ui.painter().with_clip_rect(clip);
+    painter.rect_filled(rect, 5.0, Color32::from_rgba_unmultiplied(7, 12, 18, 235));
+    painter.rect_stroke(
+        rect,
+        5.0,
+        Stroke::new(1.0, Color32::from_rgb(79, 112, 143)),
+        StrokeKind::Inside,
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(8.0, 6.0),
+        egui::Align2::LEFT_TOP,
+        text,
+        FontId::monospace(12.5),
+        Color32::from_rgb(226, 232, 240),
+    );
+}
+
+fn paint_probe_status(ui: &egui::Ui, clip: egui::Rect, text: &str) {
+    ui.painter().with_clip_rect(clip).text(
+        clip.left_bottom() + egui::vec2(10.0, -10.0),
+        egui::Align2::LEFT_BOTTOM,
+        text,
+        FontId::proportional(12.5),
+        MUTED,
+    );
+}
+
+fn paint_probe_measurements_2d(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    bounds: [f32; 4],
+    measurements: &[ProbeMeasurement],
+    relative_path: &str,
+    variable: &str,
+) {
+    let painter = ui.painter().with_clip_rect(rect);
+    for measurement in measurements.iter().filter(|measurement| {
+        measurement.visible
+            && measurement.dimension == ProbeDimension::TwoD
+            && measurement.relative_path == relative_path
+            && measurement.scope_variable == variable
+    }) {
+        let position = crate::annotations::data_to_screen(
+            DataPoint::new(measurement.position[0], measurement.position[1]),
+            rect,
+            bounds,
+        );
+        paint_probe_pin(&painter, position, measurement);
+    }
+}
+
+fn paint_probe_measurements_3d(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    scene: &Scene3dHandle,
+    measurements: &[ProbeMeasurement],
+    relative_path: &str,
+    variable: &str,
+) {
+    let shared = scene.lock().unwrap();
+    let Some(data) = &shared.data else { return };
+    let aspect = rect.width() / rect.height().max(1.0);
+    let painter = ui.painter().with_clip_rect(rect);
+    for measurement in measurements.iter().filter(|measurement| {
+        measurement.visible
+            && measurement.dimension == ProbeDimension::ThreeD
+            && measurement.relative_path == relative_path
+            && measurement.scope_variable == variable
+    }) {
+        let point = measurement.position.map(|value| value as f32);
+        let Some(projected) = shared
+            .camera
+            .project(point, data.header.active_bounds(), aspect)
+        else {
+            continue;
+        };
+        if !(0.0..=1.0).contains(&projected[2]) {
+            continue;
+        }
+        let position = egui::pos2(
+            rect.left() + (projected[0] + 1.0) * 0.5 * rect.width(),
+            rect.bottom() - (projected[1] + 1.0) * 0.5 * rect.height(),
+        );
+        paint_probe_pin(&painter, position, measurement);
+    }
+}
+
+fn paint_probe_pin(painter: &egui::Painter, position: egui::Pos2, measurement: &ProbeMeasurement) {
+    let color = Color32::from_rgb(255, 205, 74);
+    painter.circle_filled(position, 3.5, color);
+    painter.circle_stroke(position, 5.5, Stroke::new(1.0, Color32::BLACK));
+    painter.text(
+        position + egui::vec2(8.0, -7.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!("{}  {:.5e}", measurement.name, measurement.value),
+        FontId::proportional(12.0),
+        color,
+    );
+}
+
 fn section_heading(ui: &mut egui::Ui, text: &str) {
     ui.label(
         RichText::new(text.to_uppercase())
-            .size(10.0)
+            .size(12.0)
             .strong()
             .color(ACCENT),
     );
     ui.add_space(3.0);
+}
+
+fn selectable_metadata_row(
+    ui: &mut egui::Ui,
+    selected: bool,
+    primary: &str,
+    secondary: &str,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width().max(1.0), 58.0),
+        Sense::click(),
+    );
+    let fill = if selected {
+        Color32::from_rgb(28, 66, 96)
+    } else if response.hovered() {
+        Color32::from_rgb(25, 36, 49)
+    } else {
+        Color32::from_rgb(18, 27, 38)
+    };
+    let border = if selected {
+        Color32::from_rgb(74, 166, 226)
+    } else if response.hovered() {
+        Color32::from_rgb(54, 78, 99)
+    } else {
+        Color32::from_rgb(31, 43, 57)
+    };
+    ui.painter().rect_filled(rect, 5.0, fill);
+    ui.painter()
+        .rect_stroke(rect, 5.0, Stroke::new(1.0, border), StrokeKind::Inside);
+    if selected {
+        ui.painter().line_segment(
+            [
+                rect.left_top() + egui::vec2(2.0, 7.0),
+                rect.left_bottom() + egui::vec2(2.0, -7.0),
+            ],
+            Stroke::new(3.0, ACCENT),
+        );
+    }
+    let painter = ui
+        .painter()
+        .with_clip_rect(rect.shrink2(egui::vec2(9.0, 0.0)));
+    painter.text(
+        rect.left_top() + egui::vec2(11.0, 8.0),
+        egui::Align2::LEFT_TOP,
+        primary,
+        FontId::proportional(14.5),
+        ui.visuals().strong_text_color(),
+    );
+    painter.text(
+        rect.left_top() + egui::vec2(11.0, 33.0),
+        egui::Align2::LEFT_TOP,
+        secondary,
+        FontId::proportional(12.5),
+        MUTED,
+    );
+    response
 }
 
 fn metadata_row(ui: &mut egui::Ui, label: &str, value: &str) {
@@ -3242,6 +5969,80 @@ fn variable_combo(
                 ui.selectable_value(selected, Some(canonical.clone()), display);
             }
         });
+}
+
+fn components_are_distinct(components: &[Option<String>; 3]) -> bool {
+    let [Some(x), Some(y), Some(z)] = components else {
+        return false;
+    };
+    x != y && x != z && y != z
+}
+
+fn latitude_seed_controls(
+    ui: &mut egui::Ui,
+    settings: &mut LatitudeSeedSettings,
+    include_longitudes: bool,
+) {
+    section_heading(ui, "Planetary footpoints");
+    ui.checkbox(&mut settings.enabled, "Seed along selected latitudes");
+    ui.label(
+        RichText::new("Seeds are used for tracing but are not drawn in the viewer.")
+            .small()
+            .color(MUTED),
+    );
+    if !settings.enabled {
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.label("Footpoint radius");
+        ui.add(
+            egui::DragValue::new(&mut settings.radius)
+                .range(0.1..=50.0)
+                .speed(0.05)
+                .suffix(" Re"),
+        );
+    });
+    if include_longitudes {
+        ui.add(
+            egui::DragValue::new(&mut settings.longitude_count)
+                .range(1..=36)
+                .prefix("Longitudes per latitude "),
+        );
+    }
+    ui.label(RichText::new("Latitudes").small().color(MUTED));
+    let mut remove = None;
+    for (index, latitude) in settings.latitudes.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::DragValue::new(latitude)
+                    .range(-90.0..=90.0)
+                    .speed(1.0)
+                    .suffix("°"),
+            );
+            if ui
+                .small_button("×")
+                .on_hover_text("Remove latitude")
+                .clicked()
+            {
+                remove = Some(index);
+            }
+        });
+    }
+    if let Some(index) = remove {
+        settings.latitudes.remove(index);
+    }
+    ui.horizontal(|ui| {
+        if ui.small_button("Add latitude").clicked() {
+            settings.latitudes.push(0.0);
+        }
+        let count = settings.latitudes.len()
+            * if include_longitudes {
+                usize::from(settings.longitude_count.max(1))
+            } else {
+                2
+            };
+        ui.small(RichText::new(format!("{count} generated footpoints")).color(MUTED));
+    });
 }
 
 fn coordinate_axis(label: &str) -> Option<char> {
@@ -3279,6 +6080,62 @@ fn seed_grid(bounds: [f32; 4], columns: u8, rows: u8) -> Vec<DataPoint> {
             })
         })
         .collect()
+}
+
+fn latitude_footpoints3d(settings: &LatitudeSeedSettings) -> Vec<DataPoint3> {
+    if !settings.enabled || !settings.radius.is_finite() || settings.radius <= 0.0 {
+        return Vec::new();
+    }
+    let longitude_count = usize::from(settings.longitude_count.clamp(1, 36));
+    settings
+        .latitudes
+        .iter()
+        .copied()
+        .filter(|latitude| latitude.is_finite() && (-90.0..=90.0).contains(latitude))
+        .flat_map(|latitude| {
+            let latitude = f64::from(latitude).to_radians();
+            (0..longitude_count).map(move |index| {
+                let longitude = std::f64::consts::TAU * index as f64 / longitude_count as f64;
+                let radius = f64::from(settings.radius);
+                DataPoint3::new(
+                    radius * latitude.cos() * longitude.cos(),
+                    radius * latitude.cos() * longitude.sin(),
+                    radius * latitude.sin(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn seed_grid3d(bounds: [f32; 6], counts: [u8; 3]) -> Vec<DataPoint3> {
+    if bounds.iter().any(|value| !value.is_finite())
+        || bounds[0] > bounds[1]
+        || bounds[2] > bounds[3]
+        || bounds[4] > bounds[5]
+    {
+        return Vec::new();
+    }
+    let counts = counts.map(|count| usize::from(count.clamp(1, 12)));
+    let coordinate = |index: usize, count: usize, minimum: f32, maximum: f32| {
+        if count == 1 {
+            0.5 * f64::from(minimum + maximum)
+        } else {
+            f64::from(minimum) + f64::from(maximum - minimum) * index as f64 / (count - 1) as f64
+        }
+    };
+    let mut seeds = Vec::with_capacity(counts[0] * counts[1] * counts[2]);
+    for z in 0..counts[2] {
+        for y in 0..counts[1] {
+            for x in 0..counts[0] {
+                seeds.push(DataPoint3::new(
+                    coordinate(x, counts[0], bounds[0], bounds[1]),
+                    coordinate(y, counts[1], bounds[2], bounds[3]),
+                    coordinate(z, counts[2], bounds[4], bounds[5]),
+                ));
+            }
+        }
+    }
+    seeds
 }
 
 fn axis_limit_row(
@@ -3708,5 +6565,34 @@ mod tests {
         assert_eq!(seeds.len(), 12);
         assert!(seeds.iter().all(|seed| seed.x > -10.0 && seed.x < 10.0));
         assert!(seeds.iter().all(|seed| seed.y > -5.0 && seed.y < 5.0));
+    }
+
+    #[test]
+    fn three_dimensional_footpoints_follow_latitude_and_radius() {
+        let settings = LatitudeSeedSettings {
+            enabled: true,
+            radius: 2.5,
+            latitudes: vec![-30.0, 30.0],
+            longitude_count: 4,
+        };
+        let seeds = latitude_footpoints3d(&settings);
+        assert_eq!(seeds.len(), 8);
+        assert!(seeds.iter().all(|seed| {
+            (seed.x * seed.x + seed.y * seed.y + seed.z * seed.z - 6.25).abs() < 1.0e-9
+        }));
+        assert!(seeds.iter().any(|seed| (seed.z - 1.25).abs() < 1.0e-6));
+        assert!(seeds.iter().any(|seed| (seed.z + 1.25).abs() < 1.0e-6));
+    }
+
+    #[test]
+    fn custom_three_dimensional_seed_grid_has_exact_bounds() {
+        let seeds = seed_grid3d([-1.0, 1.0, -2.0, 2.0, 3.0, 5.0], [2, 3, 2]);
+        assert_eq!(seeds.len(), 12);
+        assert!(
+            seeds
+                .iter()
+                .any(|seed| seed.as_array() == [-1.0, -2.0, 3.0])
+        );
+        assert!(seeds.iter().any(|seed| seed.as_array() == [1.0, 2.0, 5.0]));
     }
 }

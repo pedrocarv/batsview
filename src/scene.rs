@@ -4,7 +4,11 @@ use anyhow::{Result, bail};
 use eframe::egui::Color32;
 use serde::{Deserialize, Serialize};
 
-pub const SCENE_VERSION: u32 = 1;
+use crate::camera3d::Camera3d;
+
+pub const SCENE_VERSION: u32 = 2;
+pub const MAX_ISOSURFACE_LAYERS: usize = 8;
+pub const MAX_PROBE_MEASUREMENTS: usize = 100;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -230,6 +234,138 @@ impl Default for RgbaColor {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", content = "triangles", rename_all = "snake_case")]
+pub enum MeshBudget {
+    #[default]
+    Auto,
+    Limited(u32),
+    Full,
+}
+
+impl MeshBudget {
+    pub const AUTO_TRIANGLES: u32 = 500_000;
+
+    pub fn triangle_limit(self) -> Option<u32> {
+        match self {
+            Self::Auto => Some(Self::AUTO_TRIANGLES),
+            Self::Limited(limit) => Some(limit.clamp(100_000, 2_000_000)),
+            Self::Full => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum IsosurfaceColoring {
+    Solid {
+        #[serde(default)]
+        color: RgbaColor,
+    },
+    Scalar {
+        variable: String,
+        #[serde(default)]
+        appearance: AppearanceSettings,
+    },
+}
+
+impl Default for IsosurfaceColoring {
+    fn default() -> Self {
+        Self::Solid {
+            color: RgbaColor::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IsosurfaceLayer {
+    pub id: u64,
+    pub name: String,
+    pub variable: String,
+    pub isovalue: f64,
+    pub visible: bool,
+    pub locked: bool,
+    pub opacity: f32,
+    pub coloring: IsosurfaceColoring,
+    pub mesh_budget: MeshBudget,
+}
+
+impl Default for IsosurfaceLayer {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: "Isosurface".to_owned(),
+            variable: String::new(),
+            isovalue: 0.0,
+            visible: true,
+            locked: false,
+            opacity: 0.86,
+            coloring: IsosurfaceColoring::default(),
+            mesh_budget: MeshBudget::Auto,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CropBox3d {
+    pub enabled: bool,
+    /// Normalized [x-low, x-high, y-low, y-high, z-low, z-high].
+    pub fractions: [f32; 6],
+}
+
+impl Default for CropBox3d {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fractions: [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeDimension {
+    #[default]
+    TwoD,
+    ThreeD,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProbeMeasurement {
+    pub id: u64,
+    pub name: String,
+    pub dimension: ProbeDimension,
+    pub position: [f64; 3],
+    pub value: f64,
+    pub variable: String,
+    pub unit: Option<String>,
+    pub relative_path: String,
+    pub scope_variable: String,
+    pub layer_id: Option<u64>,
+    pub visible: bool,
+}
+
+impl Default for ProbeMeasurement {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: "Measurement".to_owned(),
+            dimension: ProbeDimension::TwoD,
+            position: [0.0; 3],
+            value: 0.0,
+            variable: String::new(),
+            unit: None,
+            relative_path: String::new(),
+            scope_variable: String::new(),
+            layer_id: None,
+            visible: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DataPoint {
     pub x: f64,
@@ -239,6 +375,45 @@ pub struct DataPoint {
 impl DataPoint {
     pub fn new(x: f64, y: f64) -> Self {
         Self { x, y }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DataPoint3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl DataPoint3 {
+    pub fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+
+    pub fn as_array(self) -> [f64; 3] {
+        [self.x, self.y, self.z]
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LatitudeSeedSettings {
+    pub enabled: bool,
+    pub radius: f32,
+    pub latitudes: Vec<f32>,
+    pub longitude_count: u8,
+}
+
+impl Default for LatitudeSeedSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            radius: 2.55,
+            latitudes: vec![
+                -75.0, -60.0, -45.0, -30.0, -15.0, 15.0, 30.0, 45.0, 60.0, 75.0,
+            ],
+            longitude_count: 6,
+        }
     }
 }
 
@@ -261,6 +436,10 @@ pub struct StreamlineSettings {
     pub vertical_component: Option<String>,
     #[serde(default)]
     pub seeds: Vec<DataPoint>,
+    #[serde(default)]
+    pub latitude_seeds: LatitudeSeedSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_region: Option<[f32; 4]>,
     #[serde(default = "default_streamline_step")]
     pub step_fraction: f32,
     #[serde(default = "default_streamline_steps")]
@@ -316,6 +495,8 @@ impl Default for StreamlineSettings {
             horizontal_component: None,
             vertical_component: None,
             seeds: Vec::new(),
+            latitude_seeds: LatitudeSeedSettings::default(),
+            seed_region: None,
             step_fraction: default_streamline_step(),
             max_steps: default_streamline_steps(),
             direction: StreamlineDirection::Both,
@@ -325,6 +506,44 @@ impl Default for StreamlineSettings {
             arrow_size: default_streamline_arrow_size(),
             seed_columns: default_seed_columns(),
             seed_rows: default_seed_rows(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FieldLine3dSettings {
+    pub enabled: bool,
+    pub components: [Option<String>; 3],
+    pub latitude_seeds: LatitudeSeedSettings,
+    pub custom_seeds: Vec<DataPoint3>,
+    pub seed_region: Option<[f32; 6]>,
+    pub region_counts: [u8; 3],
+    pub step_size: f32,
+    pub max_steps: u32,
+    pub max_length: f32,
+    pub color: RgbaColor,
+    pub width: f32,
+    pub arrows: bool,
+    pub arrow_size: f32,
+}
+
+impl Default for FieldLine3dSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            components: [None, None, None],
+            latitude_seeds: LatitudeSeedSettings::default(),
+            custom_seeds: Vec::new(),
+            seed_region: None,
+            region_counts: [3, 3, 3],
+            step_size: 0.15,
+            max_steps: 4_000,
+            max_length: 500.0,
+            color: default_streamline_color(),
+            width: 1.5,
+            arrows: true,
+            arrow_size: 7.0,
         }
     }
 }
@@ -549,6 +768,70 @@ fn default_true() -> bool {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct View2dSettings {
+    pub show_inner_boundary: bool,
+    pub inner_boundary_radius: f32,
+    pub show_earth: bool,
+    pub earth_radius: f32,
+    pub dayside_direction: DaysideDirection2d,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaysideDirection2d {
+    #[default]
+    PositiveX,
+    NegativeX,
+}
+
+impl Default for View2dSettings {
+    fn default() -> Self {
+        Self {
+            show_inner_boundary: true,
+            inner_boundary_radius: 2.5,
+            show_earth: true,
+            earth_radius: 1.0,
+            dayside_direction: DaysideDirection2d::PositiveX,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct View3dSettings {
+    pub slice_enabled: [bool; 3],
+    /// Slice locations normalized to the data bounds for portable scene files.
+    pub slice_fractions: [f32; 3],
+    /// New scenes begin at coordinate zero when zero lies inside an axis range.
+    pub slice_auto_origin: [bool; 3],
+    pub surface_opacity: f32,
+    pub show_axes: bool,
+    pub show_box: bool,
+    pub show_reference_sphere: bool,
+    pub reference_sphere_radius: f32,
+    pub crop: CropBox3d,
+    pub camera: Option<Camera3d>,
+}
+
+impl Default for View3dSettings {
+    fn default() -> Self {
+        Self {
+            slice_enabled: [true; 3],
+            slice_fractions: [0.5; 3],
+            slice_auto_origin: [true; 3],
+            surface_opacity: 0.94,
+            show_axes: true,
+            show_box: true,
+            show_reference_sphere: true,
+            reference_sphere_radius: 2.5,
+            crop: CropBox3d::default(),
+            camera: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SceneDocument {
     pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -561,11 +844,33 @@ pub struct SceneDocument {
     pub annotations: Vec<Annotation>,
     #[serde(default)]
     pub streamlines: BTreeMap<String, StreamlineSettings>,
+    #[serde(default)]
+    pub fieldlines3d: BTreeMap<String, FieldLine3dSettings>,
+    #[serde(default)]
+    pub isosurfaces: BTreeMap<String, Vec<IsosurfaceLayer>>,
+    #[serde(default)]
+    pub measurements: Vec<ProbeMeasurement>,
+    #[serde(default)]
+    pub view2d: View2dSettings,
+    #[serde(default)]
+    pub view3d: View3dSettings,
     #[serde(default = "first_annotation_id")]
     pub next_annotation_id: u64,
+    #[serde(default = "first_isosurface_id")]
+    pub next_isosurface_id: u64,
+    #[serde(default = "first_measurement_id")]
+    pub next_measurement_id: u64,
 }
 
 fn first_annotation_id() -> u64 {
+    1
+}
+
+fn first_isosurface_id() -> u64 {
+    1
+}
+
+fn first_measurement_id() -> u64 {
     1
 }
 
@@ -578,12 +883,31 @@ impl Default for SceneDocument {
             variable_overrides: BTreeMap::new(),
             annotations: Vec::new(),
             streamlines: BTreeMap::new(),
+            fieldlines3d: BTreeMap::new(),
+            isosurfaces: BTreeMap::new(),
+            measurements: Vec::new(),
+            view2d: View2dSettings::default(),
+            view3d: View3dSettings::default(),
             next_annotation_id: first_annotation_id(),
+            next_isosurface_id: first_isosurface_id(),
+            next_measurement_id: first_measurement_id(),
         }
     }
 }
 
 impl SceneDocument {
+    pub fn migrate(mut self) -> Result<Self> {
+        match self.version {
+            1 => self.version = SCENE_VERSION,
+            SCENE_VERSION => {}
+            version => {
+                bail!("scene version {version} is not supported (expected 1 or {SCENE_VERSION})");
+            }
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.version != SCENE_VERSION {
             bail!(
@@ -592,7 +916,70 @@ impl SceneDocument {
                 SCENE_VERSION
             );
         }
+        for layers in self.isosurfaces.values() {
+            if layers.len() > MAX_ISOSURFACE_LAYERS {
+                bail!(
+                    "a scene may contain at most {MAX_ISOSURFACE_LAYERS} isosurfaces per section"
+                );
+            }
+            let mut ids = HashSet::new();
+            for layer in layers {
+                if !ids.insert(layer.id) {
+                    bail!("duplicate isosurface layer id {}", layer.id);
+                }
+                if layer.variable.trim().is_empty() || !layer.isovalue.is_finite() {
+                    bail!("isosurface layers require a variable and finite isovalue");
+                }
+                if !layer.opacity.is_finite() || !(0.05..=1.0).contains(&layer.opacity) {
+                    bail!("isosurface opacity must be between 0.05 and 1");
+                }
+            }
+        }
+        if self.measurements.len() > MAX_PROBE_MEASUREMENTS {
+            bail!("a scene may contain at most {MAX_PROBE_MEASUREMENTS} measurements");
+        }
+        if self.measurements.iter().any(|measurement| {
+            !measurement.value.is_finite()
+                || measurement.position.iter().any(|value| !value.is_finite())
+        }) {
+            bail!("probe measurements require finite coordinates and values");
+        }
+        let crop = self.view3d.crop;
+        for axis in 0..3 {
+            let low = crop.fractions[axis * 2];
+            let high = crop.fractions[axis * 2 + 1];
+            if !low.is_finite() || !high.is_finite() || low < 0.0 || high > 1.0 || low >= high {
+                bail!("3D crop fractions must be finite ordered values between 0 and 1");
+            }
+        }
         Ok(())
+    }
+
+    pub fn isosurfaces_for(&self, section: Option<&str>) -> &[IsosurfaceLayer] {
+        self.isosurfaces
+            .get(section.unwrap_or("3d"))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub fn set_isosurfaces_for(&mut self, section: Option<&str>, layers: Vec<IsosurfaceLayer>) {
+        let key = section.unwrap_or("3d").to_owned();
+        if layers.is_empty() {
+            self.isosurfaces.remove(&key);
+        } else {
+            self.isosurfaces.insert(key, layers);
+        }
+    }
+
+    pub fn allocate_isosurface_id(&mut self) -> u64 {
+        let id = self.next_isosurface_id.max(1);
+        self.next_isosurface_id = id.saturating_add(1);
+        id
+    }
+
+    pub fn allocate_measurement_id(&mut self) -> u64 {
+        let id = self.next_measurement_id.max(1);
+        self.next_measurement_id = id.saturating_add(1);
+        id
     }
 
     pub fn appearance_for(&self, variable: Option<&str>) -> AppearanceSettings {
@@ -615,6 +1002,22 @@ impl SceneDocument {
             self.streamlines.remove(&key);
         } else {
             self.streamlines.insert(key, settings);
+        }
+    }
+
+    pub fn fieldlines3d_for(&self, section: Option<&str>) -> FieldLine3dSettings {
+        self.fieldlines3d
+            .get(section.unwrap_or("3d"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_fieldlines3d_for(&mut self, section: Option<&str>, settings: FieldLine3dSettings) {
+        let key = section.unwrap_or("3d").to_owned();
+        if settings == FieldLine3dSettings::default() {
+            self.fieldlines3d.remove(&key);
+        } else {
+            self.fieldlines3d.insert(key, settings);
         }
     }
 
@@ -1131,6 +1534,55 @@ mod tests {
                 ..StreamlineSettings::default()
             },
         );
+        scene.set_fieldlines3d_for(
+            Some("3d"),
+            FieldLine3dSettings {
+                enabled: true,
+                components: [
+                    Some("magnetic_field.x".into()),
+                    Some("magnetic_field.y".into()),
+                    Some("magnetic_field.z".into()),
+                ],
+                custom_seeds: vec![DataPoint3::new(3.0, 0.0, 0.0)],
+                ..FieldLine3dSettings::default()
+            },
+        );
+        scene.view3d.crop = CropBox3d {
+            enabled: true,
+            fractions: [0.1, 0.8, 0.2, 0.9, 0.0, 0.75],
+        };
+        let surface_id = scene.allocate_isosurface_id();
+        scene.set_isosurfaces_for(
+            Some("3d"),
+            vec![IsosurfaceLayer {
+                id: surface_id,
+                name: "Magnetopause".into(),
+                variable: "pressure".into(),
+                isovalue: 1.25,
+                coloring: IsosurfaceColoring::Scalar {
+                    variable: "density".into(),
+                    appearance: AppearanceSettings {
+                        colormap: Colormap::Plasma,
+                        ..AppearanceSettings::default()
+                    },
+                },
+                mesh_budget: MeshBudget::Limited(250_000),
+                ..IsosurfaceLayer::default()
+            }],
+        );
+        let measurement_id = scene.allocate_measurement_id();
+        scene.measurements.push(ProbeMeasurement {
+            id: measurement_id,
+            name: "Nose".into(),
+            dimension: ProbeDimension::ThreeD,
+            position: [10.0, 0.0, 0.0],
+            value: 4.2,
+            variable: "density".into(),
+            relative_path: "3d/frame.plt".into(),
+            scope_variable: "density".into(),
+            layer_id: Some(surface_id),
+            ..ProbeMeasurement::default()
+        });
         scene.add_annotation(
             AnnotationGeometry::Line {
                 start: DataPoint::new(0.0, 1.0),
@@ -1153,8 +1605,33 @@ mod tests {
             r#"{"version":1,"run_defaults":{},"variable_overrides":{},"annotations":[],"next_annotation_id":1}"#,
         )
         .unwrap();
+        let decoded = decoded.migrate().unwrap();
+        assert_eq!(decoded.version, SCENE_VERSION);
         assert!(decoded.streamlines.is_empty());
         assert!(!decoded.streamlines_for(Some("z=0")).enabled);
+        assert!(decoded.fieldlines3d.is_empty());
+        assert!(!decoded.fieldlines3d_for(Some("3d")).enabled);
+        assert!(decoded.view2d.show_inner_boundary);
+        assert_eq!(decoded.view2d.inner_boundary_radius, 2.5);
+        assert!(decoded.view2d.show_earth);
+        assert_eq!(decoded.view2d.earth_radius, 1.0);
+        assert_eq!(
+            decoded.view2d.dayside_direction,
+            DaysideDirection2d::PositiveX
+        );
+        assert_eq!(decoded.view3d.reference_sphere_radius, 2.5);
+        assert!(decoded.isosurfaces.is_empty());
+        assert!(decoded.measurements.is_empty());
+    }
+
+    #[test]
+    fn future_scene_versions_are_rejected() {
+        let scene = SceneDocument {
+            version: SCENE_VERSION + 1,
+            ..SceneDocument::default()
+        };
+        let error = scene.migrate().unwrap_err().to_string();
+        assert!(error.contains("not supported"));
     }
 
     #[test]

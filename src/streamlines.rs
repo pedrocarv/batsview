@@ -45,7 +45,17 @@ impl VectorField {
     }
 
     pub fn integrate(&self, settings: &StreamlineSettings) -> Vec<Vec<DataPoint>> {
-        if !settings.enabled || settings.seeds.is_empty() {
+        if !settings.enabled {
+            return Vec::new();
+        }
+        let mut seeds = latitude_footpoints_2d(
+            settings,
+            &self.horizontal.header.x_label,
+            &self.horizontal.header.y_label,
+            self.locator.bounds.map(|value| value as f32),
+        );
+        seeds.extend(settings.seeds.iter().copied());
+        if seeds.is_empty() {
             return Vec::new();
         }
         let diagonal = ((self.locator.bounds[1] - self.locator.bounds[0]).powi(2)
@@ -56,8 +66,7 @@ impl VectorField {
             return Vec::new();
         }
         let max_steps = settings.max_steps.clamp(10, 5_000) as usize;
-        settings
-            .seeds
+        seeds
             .iter()
             .filter_map(|seed| {
                 let line = match settings.direction {
@@ -169,6 +178,74 @@ impl VectorField {
         }
         None
     }
+}
+
+pub fn latitude_footpoints_2d(
+    settings: &StreamlineSettings,
+    x_label: &str,
+    y_label: &str,
+    bounds: [f32; 4],
+) -> Vec<DataPoint> {
+    if !settings.latitude_seeds.enabled
+        || !settings.latitude_seeds.radius.is_finite()
+        || settings.latitude_seeds.radius <= 0.0
+    {
+        return Vec::new();
+    }
+    let axis = |label: &str| {
+        label
+            .trim_start()
+            .chars()
+            .next()
+            .map(|value| value.to_ascii_lowercase())
+            .filter(|value| matches!(value, 'x' | 'y' | 'z'))
+    };
+    let (Some(x_axis), Some(y_axis)) = (axis(x_label), axis(y_label)) else {
+        return Vec::new();
+    };
+    let radius = f64::from(settings.latitude_seeds.radius);
+    let mut seeds = Vec::new();
+    if x_axis == 'z' || y_axis == 'z' {
+        let horizontal_axis = if x_axis == 'z' { y_axis } else { x_axis };
+        if !matches!(horizontal_axis, 'x' | 'y') {
+            return Vec::new();
+        }
+        for &latitude in &settings.latitude_seeds.latitudes {
+            if !latitude.is_finite() || latitude.abs() >= 90.0 {
+                continue;
+            }
+            let radians = f64::from(latitude).to_radians();
+            let horizontal = radius * radians.cos();
+            let vertical = radius * radians.sin();
+            for side in [-1.0, 1.0] {
+                let coordinate = |axis: char| match axis {
+                    'z' => vertical,
+                    value if value == horizontal_axis => side * horizontal,
+                    _ => 0.0,
+                };
+                seeds.push(DataPoint::new(coordinate(x_axis), coordinate(y_axis)));
+            }
+        }
+    } else if matches!((x_axis, y_axis), ('x', 'y') | ('y', 'x')) {
+        let count = usize::from(settings.latitude_seeds.longitude_count.clamp(4, 64));
+        for index in 0..count {
+            let angle = std::f64::consts::TAU * index as f64 / count as f64;
+            let x = radius * angle.cos();
+            let y = radius * angle.sin();
+            seeds.push(if x_axis == 'x' {
+                DataPoint::new(x, y)
+            } else {
+                DataPoint::new(y, x)
+            });
+        }
+    }
+    seeds.retain(|seed| {
+        seed.x >= f64::from(bounds[0])
+            && seed.x <= f64::from(bounds[1])
+            && seed.y >= f64::from(bounds[2])
+            && seed.y <= f64::from(bounds[3])
+    });
+    seeds
 }
 
 #[derive(Debug)]
@@ -413,5 +490,49 @@ mod tests {
         let point = screen_to_data(rect.center(), rect, [-2.0, 2.0, -1.0, 3.0]);
         assert!((point.x - 0.0).abs() < 1.0e-6);
         assert!((point.y - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn meridional_footpoints_follow_configured_latitudes() {
+        let settings = StreamlineSettings {
+            latitude_seeds: crate::scene::LatitudeSeedSettings {
+                enabled: true,
+                radius: 2.5,
+                latitudes: vec![0.0, 30.0],
+                longitude_count: 6,
+            },
+            ..StreamlineSettings::default()
+        };
+        let seeds = latitude_footpoints_2d(&settings, "X", "Z", [-5.0, 5.0, -5.0, 5.0]);
+        assert_eq!(seeds.len(), 4);
+        assert!(
+            seeds
+                .iter()
+                .any(|seed| (seed.x - 2.5).abs() < 1.0e-6 && seed.y.abs() < 1.0e-6)
+        );
+        assert!(seeds.iter().any(|seed| {
+            (seed.x - 2.5 * 30.0_f64.to_radians().cos()).abs() < 1.0e-6
+                && (seed.y - 1.25).abs() < 1.0e-6
+        }));
+    }
+
+    #[test]
+    fn equatorial_footpoints_form_a_longitude_ring() {
+        let settings = StreamlineSettings {
+            latitude_seeds: crate::scene::LatitudeSeedSettings {
+                enabled: true,
+                radius: 2.5,
+                latitudes: vec![-45.0, 45.0],
+                longitude_count: 8,
+            },
+            ..StreamlineSettings::default()
+        };
+        let seeds = latitude_footpoints_2d(&settings, "X", "Y", [-5.0, 5.0, -5.0, 5.0]);
+        assert_eq!(seeds.len(), 8);
+        assert!(
+            seeds
+                .iter()
+                .all(|seed| (seed.x.hypot(seed.y) - 2.5).abs() < 1.0e-6)
+        );
     }
 }

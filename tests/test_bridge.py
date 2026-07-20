@@ -126,6 +126,340 @@ def test_mesh_id_is_stable_and_changes_with_connectivity() -> None:
     assert bridge._mesh_id(positions, first) != bridge._mesh_id(positions, second)
 
 
+def test_3d_brick_slice_writes_compact_surface_payload(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "3d__var_1_t00000001_n00000001.plt"
+    path.write_bytes(b"fixture")
+    coordinates = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ]
+    )
+    zone = bp.Zone(
+        name="volume",
+        arrays={
+            "X [R]": coordinates[:, 0],
+            "Y [R]": coordinates[:, 1],
+            "Z [R]": coordinates[:, 2],
+            "density": coordinates.sum(axis=1) + 1.0,
+        },
+        connectivity=np.arange(8, dtype=np.uint32).reshape(1, 8),
+        zone_type="Brick",
+        original_names={"density": "Rho [amu/cm^3]"},
+        units={"density": "amu/cm^3"},
+    )
+    dataset = bp.Dataset(path=path, title="3D fixture", zones=(zone,), section="3d")
+    monkeypatch.setattr(bp, "read", lambda *args, **kwargs: dataset)
+    output = tmp_path / "slice.b3s"
+    response = bridge._load_surface3d(
+        input_path=str(path),
+        variable_name="density",
+        output_path=str(output),
+        planes=[{"axis": "x", "position": 0.5, "enabled": True, "normalized": True}],
+        cache=False,
+    )
+
+    assert response["triangle_count"] > 0
+    assert response["vertex_count"] <= response["triangle_count"] * 3
+    assert len(response["layers"]) == 1
+    layer = response["layers"][0]
+    assert layer["kind"] == "slice"
+    assert layer["axis"] == "x"
+    assert layer["position"] == 0.5
+    assert layer["index_start"] == 0
+    assert layer["index_count"] == response["triangle_count"] * 3
+    payload = output.read_bytes()
+    assert payload[:4] == b"B3S2"
+    header_size = struct.unpack_from("<I", payload, 4)[0]
+    header = json.loads(payload[8 : 8 + header_size])
+    offset = 8 + header_size
+    positions = np.frombuffer(
+        payload, dtype="<f4", count=header["vertex_count"] * 3, offset=offset
+    ).reshape(-1, 3)
+    assert np.allclose(positions[:, 0], 0.5)
+    assert len(payload) == (
+        8
+        + header_size
+        + header["vertex_count"] * 3 * 4
+        + header["vertex_count"] * 4
+        + header["triangle_count"] * 3 * 4
+    )
+
+    scalar_only = tmp_path / "slice-scalar.b3s"
+    reused = bridge._load_surface3d(
+        input_path=str(path),
+        variable_name="density",
+        output_path=str(scalar_only),
+        planes=[{"axis": "x", "position": 0.5, "enabled": True, "normalized": True}],
+        cache=False,
+        reuse_mesh_id=response["mesh_id"],
+    )
+    assert reused["mesh_included"] is False
+    scalar_payload = scalar_only.read_bytes()
+    scalar_header_size = struct.unpack_from("<I", scalar_payload, 4)[0]
+    assert len(scalar_payload) == 8 + scalar_header_size + reused["vertex_count"] * 4
+
+
+def test_tetra_isosurface_interpolates_secondary_scalar() -> None:
+    coordinates = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    tetrahedra = np.asarray([[0, 1, 2, 3]], dtype=np.intp)
+    contour = coordinates.sum(axis=1)
+    secondary = 2.0 * coordinates[:, 0] + 3.0 * coordinates[:, 1] + 4.0 * coordinates[:, 2]
+    positions, values = bridge._contour_tetrahedra(
+        tetrahedra, coordinates, contour, secondary, 0.5
+    )
+    assert positions.shape == (3, 3)
+    assert np.allclose(positions.sum(axis=1), 0.5)
+    expected = 2.0 * positions[:, 0] + 3.0 * positions[:, 1] + 4.0 * positions[:, 2]
+    assert np.allclose(values, expected)
+
+
+def test_crop_clips_triangles_and_interpolates_values_exactly() -> None:
+    positions = np.asarray(
+        [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64
+    )
+    values = positions[:, 0].copy()
+    crop = np.asarray([[-0.25, 0.5], [-1.0, 2.0], [-1.0, 1.0]], dtype=np.float64)
+    clipped, interpolated = bridge._clip_triangles_to_box(positions, values, crop)
+    assert clipped.shape[0] % 3 == 0
+    assert clipped.shape[0] >= 3
+    assert np.all(clipped[:, 0] >= -0.25 - 1.0e-12)
+    assert np.all(clipped[:, 0] <= 0.5 + 1.0e-12)
+    assert np.any(np.isclose(clipped[:, 0], -0.25))
+    assert np.any(np.isclose(clipped[:, 0], 0.5))
+    assert np.allclose(interpolated, clipped[:, 0])
+
+
+def test_crop_clips_fieldline_segments_at_exact_boundaries() -> None:
+    line = np.asarray(
+        [[-2.0, 0.0, 0.0], [0.0, 0.0, 0.0], [2.0, 0.0, 0.0]], dtype=np.float64
+    )
+    bounds = np.asarray([[-0.5, 0.75], [-1.0, 1.0], [-1.0, 1.0]], dtype=np.float64)
+    clipped = bridge._clip_polyline_to_box(line, bounds)
+    assert len(clipped) == 1
+    assert np.allclose(clipped[0][0], [-0.5, 0.0, 0.0])
+    assert np.allclose(clipped[0][-1], [0.75, 0.0, 0.0])
+
+
+def test_3d_isosurface_crop_and_inactive_layers_are_preserved(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "3d__var_1_t00000001_n00000001.plt"
+    path.write_bytes(b"fixture")
+    coordinates = np.asarray(
+        [
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0], [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0], [0.0, 1.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    zone = bp.Zone(
+        name="volume",
+        arrays={
+            "X [R]": coordinates[:, 0],
+            "Y [R]": coordinates[:, 1],
+            "Z [R]": coordinates[:, 2],
+            "density": coordinates.sum(axis=1),
+            "temperature": 10.0 + 2.0 * coordinates[:, 0],
+        },
+        connectivity=np.arange(8, dtype=np.uint32).reshape(1, 8),
+        zone_type="Brick",
+        units={"temperature": "K"},
+    )
+    dataset = bp.Dataset(path=path, title="3D fixture", zones=(zone,), section="3d")
+    monkeypatch.setattr(bp, "read", lambda *args, **kwargs: dataset)
+    monkeypatch.setattr(
+        bp,
+        "inspect",
+        lambda *args, **kwargs: argparse.Namespace(
+            variables=["density", "temperature", "missing"]
+        ),
+    )
+    output = tmp_path / "isosurfaces.b3s"
+    response = bridge._load_surface3d(
+        input_path=str(path),
+        variable_name="density",
+        output_path=str(output),
+        planes=[],
+        isosurfaces=[
+            {
+                "id": 11,
+                "name": "Density shell",
+                "variable": "density",
+                "color_variable": "temperature",
+                "isovalue": 1.0,
+                "triangle_limit": 500_000,
+            },
+            {
+                "id": 12,
+                "name": "Unavailable color",
+                "variable": "density",
+                "color_variable": "missing",
+                "isovalue": 1.0,
+            },
+        ],
+        crop={"enabled": True, "fractions": [0.25, 0.75, 0.0, 1.0, 0.0, 1.0]},
+        cache=False,
+    )
+    assert len(response["layers"]) == 2
+    active, inactive = response["layers"]
+    assert active["kind"] == "isosurface"
+    assert active["layer_id"] == 11
+    assert active["color_variable"] == "temperature"
+    assert active["unit"] == "K"
+    assert active["rendered_triangles"] > 0
+    assert inactive["layer_id"] == 12
+    assert "not available" in inactive["inactive_reason"]
+    payload = output.read_bytes()
+    header_size = struct.unpack_from("<I", payload, 4)[0]
+    header = json.loads(payload[8 : 8 + header_size])
+    positions = np.frombuffer(
+        payload,
+        dtype="<f4",
+        count=header["vertex_count"] * 3,
+        offset=8 + header_size,
+    ).reshape(-1, 3)
+    assert np.all(positions[:, 0] >= 0.25 - 1.0e-6)
+    assert np.all(positions[:, 0] <= 0.75 + 1.0e-6)
+
+
+def test_empty_out_of_range_isosurface_returns_inactive_b3s2(
+    tmp_path: Path, monkeypatch
+) -> None:
+    path = tmp_path / "3d__var_1_t00000001_n00000001.plt"
+    path.write_bytes(b"fixture")
+    coordinates = np.asarray(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+    zone = bp.Zone(
+        name="volume",
+        arrays={
+            "X [R]": coordinates[:, 0],
+            "Y [R]": coordinates[:, 1],
+            "Z [R]": coordinates[:, 2],
+            "density": coordinates.sum(axis=1),
+        },
+        connectivity=np.arange(4, dtype=np.uint32).reshape(1, 4),
+        zone_type="Tetra",
+    )
+    monkeypatch.setattr(
+        bp,
+        "read",
+        lambda *args, **kwargs: bp.Dataset(
+            path=path, title="fixture", zones=(zone,), section="3d"
+        ),
+    )
+    monkeypatch.setattr(
+        bp, "inspect", lambda *args, **kwargs: argparse.Namespace(variables=["density"])
+    )
+    output = tmp_path / "empty.b3s"
+    response = bridge._load_surface3d(
+        input_path=str(path),
+        variable_name="density",
+        output_path=str(output),
+        planes=[],
+        isosurfaces=[{"id": 1, "variable": "density", "isovalue": 99.0}],
+        cache=False,
+    )
+    assert response["triangle_count"] == 0
+    assert response["vertex_count"] == 0
+    assert response["layers"][0]["inactive_reason"]
+    assert output.read_bytes()[:4] == b"B3S2"
+
+
+def test_3d_field_tracer_integrates_constant_brick_field(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "3d__var_1_t00000001_n00000001.plt"
+    path.write_bytes(b"fixture")
+    coordinates = np.array(
+        [
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0], [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0], [0.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    zone = bp.Zone(
+        name="volume",
+        arrays={
+            "X [R]": coordinates[:, 0],
+            "Y [R]": coordinates[:, 1],
+            "Z [R]": coordinates[:, 2],
+            "magnetic_field.x": np.ones(8, dtype=np.float32),
+            "magnetic_field.y": np.zeros(8, dtype=np.float32),
+            "magnetic_field.z": np.zeros(8, dtype=np.float32),
+        },
+        connectivity=np.arange(8, dtype=np.uint32).reshape(1, 8),
+        zone_type="Brick",
+    )
+    dataset = bp.Dataset(path=path, title="3D fixture", zones=(zone,), section="3d")
+    monkeypatch.setattr(bp, "read", lambda *args, **kwargs: dataset)
+    output = tmp_path / "lines.b3l"
+    response = bridge._trace_fieldlines3d(
+        input_path=str(path),
+        components=["magnetic_field.x", "magnetic_field.y", "magnetic_field.z"],
+        seeds=[[0.5, 0.5, 0.5]],
+        output_path=str(output),
+        step=0.05,
+        max_steps=100,
+        max_length=2.0,
+        planet_radius=0.01,
+        cache=False,
+    )
+    assert response["line_count"] == 1
+    payload = output.read_bytes()
+    assert payload[:4] == b"B3L1"
+    header_size = struct.unpack_from("<I", payload, 4)[0]
+    header = json.loads(payload[8 : 8 + header_size])
+    offset = 8 + header_size + (header["line_count"] + 1) * 4
+    points = np.frombuffer(
+        payload, dtype="<f4", count=header["point_count"] * 3, offset=offset
+    ).reshape(-1, 3)
+    assert points[0, 0] < 0.1
+    assert points[-1, 0] > 0.9
+    assert np.allclose(points[:, 1:], 0.5, atol=1.0e-5)
+
+
+def test_fieldline_locator_reuses_only_an_identical_grid() -> None:
+    connectivity = np.arange(8, dtype=np.uint32).reshape(1, 8)
+    coordinates = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    bridge._FIELDLINE_LOCATOR_CACHE = None
+    mesh_id, first = bridge._fieldline_locator(connectivity, coordinates)
+    repeated_id, repeated = bridge._fieldline_locator(connectivity.copy(), coordinates.copy())
+    assert repeated_id == mesh_id
+    assert repeated is first
+
+    changed = coordinates.copy()
+    changed[6, 2] = 1.5
+    changed_id, replacement = bridge._fieldline_locator(connectivity, changed)
+    assert changed_id != mesh_id
+    assert replacement is not first
+    bridge._FIELDLINE_LOCATOR_CACHE = None
+
+
 def test_serve_handles_multiple_requests_and_structured_errors(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         bridge,
