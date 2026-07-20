@@ -10,6 +10,7 @@ use wgpu::util::DeviceExt;
 use crate::{
     camera3d::{Camera3d, project_point},
     protocol::{FieldLines3dData, Surface3dData, SurfaceLayerHeader, SurfaceLayerKind},
+    render::VIEW_DEPTH_FORMAT,
     scene::{AppearanceSettings, ColorMode, Colormap, FieldLine3dSettings, RgbaColor, Scale},
 };
 
@@ -297,7 +298,7 @@ impl Scene3dResources {
                     ..Default::default()
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth24Plus,
+                    format: VIEW_DEPTH_FORMAT,
                     depth_write_enabled: Some(depth_write_enabled),
                     depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: Default::default(),

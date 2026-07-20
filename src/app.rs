@@ -32,7 +32,7 @@ use crate::{
     },
     probe::{ProbeHit, ProbeIndex, ProbeIndexer, camera_ray},
     protocol::{BRIDGE_PROTOCOL, FieldLines3dData, FileInfo, PlotData, PlotFile, ScanResult},
-    render::{PlotCallback, PlotHandle, PlotResources, SharedPlot},
+    render::{PlotCallback, PlotHandle, PlotResources, SharedPlot, VIEW_DEPTH_FORMAT},
     render3d::{
         LayerDisplay3d, Scene3dCallback, Scene3dHandle, Scene3dResources, SharedScene3d,
         paint_fieldlines3d, paint_scene_overlays,
@@ -292,6 +292,7 @@ impl ViewerApp {
                 &render_state.device,
                 &render_state.queue,
                 render_state.target_format,
+                Some(VIEW_DEPTH_FORMAT),
             );
             render_state
                 .renderer

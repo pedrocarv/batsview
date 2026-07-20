@@ -17,7 +17,7 @@ use crate::{
         paint_reference_bodies_2d, sample_appearance,
     },
     protocol::FieldLines3dData,
-    render::{PlotCallback, PlotHandle, PlotResources},
+    render::{PlotCallback, PlotHandle, PlotResources, VIEW_DEPTH_FORMAT},
     render3d::{
         Scene3dCallback, Scene3dHandle, Scene3dResources, paint_fieldlines3d, paint_scene_overlays,
     },
@@ -163,7 +163,7 @@ pub fn render_plot_png(frame: ExportFrame) -> Result<PathBuf> {
     let mut renderer = egui_wgpu::Renderer::new(device, format, RendererOptions::default());
     renderer
         .callback_resources
-        .insert(PlotResources::new(device, queue, format));
+        .insert(PlotResources::new(device, queue, format, None));
 
     let context = egui::Context::default();
     context.set_zoom_factor(scale);
@@ -281,7 +281,7 @@ pub fn render_scene3d_png(frame: ExportFrame3d) -> Result<PathBuf> {
     let device = &frame.render_state.device;
     let queue = &frame.render_state.queue;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let depth_format = wgpu::TextureFormat::Depth24Plus;
+    let depth_format = VIEW_DEPTH_FORMAT;
     let mut renderer = egui_wgpu::Renderer::new(
         device,
         format,

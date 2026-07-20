@@ -12,6 +12,8 @@ use crate::{
     scene::{AppearanceSettings, ColorMode, Colormap, Scale},
 };
 
+pub const VIEW_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+
 #[derive(Clone, Debug)]
 pub struct DisplayState {
     pub scale: Scale,
@@ -181,6 +183,7 @@ impl PlotResources {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         target_format: wgpu::TextureFormat,
+        depth_format: Option<wgpu::TextureFormat>,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("BATSView scalar shader"),
@@ -291,7 +294,7 @@ impl PlotResources {
                 cull_mode: None,
                 ..Default::default()
             },
-            depth_stencil: None,
+            depth_stencil: plot_depth_stencil_state(depth_format),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -308,6 +311,18 @@ impl PlotResources {
             generation: u64::MAX,
         }
     }
+}
+
+fn plot_depth_stencil_state(
+    depth_format: Option<wgpu::TextureFormat>,
+) -> Option<wgpu::DepthStencilState> {
+    depth_format.map(|format| wgpu::DepthStencilState {
+        format,
+        depth_write_enabled: Some(false),
+        depth_compare: Some(wgpu::CompareFunction::Always),
+        stencil: Default::default(),
+        bias: Default::default(),
+    })
 }
 
 pub struct PlotCallback {
@@ -484,5 +499,15 @@ mod tests {
         assert!(mesh_upload_required(None, "mesh-a"));
         assert!(!mesh_upload_required(Some("mesh-a"), "mesh-a"));
         assert!(mesh_upload_required(Some("mesh-a"), "mesh-b"));
+    }
+
+    #[test]
+    fn plot_depth_state_matches_the_render_pass() {
+        assert!(plot_depth_stencil_state(None).is_none());
+
+        let state = plot_depth_stencil_state(Some(VIEW_DEPTH_FORMAT)).unwrap();
+        assert_eq!(state.format, wgpu::TextureFormat::Depth24Plus);
+        assert_eq!(state.depth_write_enabled, Some(false));
+        assert_eq!(state.depth_compare, Some(wgpu::CompareFunction::Always));
     }
 }
